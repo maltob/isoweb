@@ -62,6 +62,28 @@ describe('ISO 9660 & Joliet Builder and Parser', () => {
     const longFileBytes = await reader.read(longFile!.sourceSector! * 2048, longFile!.sourceLength!);
     expect(new TextDecoder().decode(longFileBytes)).toBe('Long filename in Joliet subfolder');
   });
+
+  it('should build an ISO with 60+ files crossing directory sector boundaries without bounds errors', async () => {
+    const vfs = VirtualFS.createNew('iso', 'MANY_FILES');
+    vfs.createDirectory('/', 'LARGE_DIR');
+
+    // Add 65 files with realistic filenames
+    for (let i = 0; i < 65; i++) {
+      const content = new TextEncoder().encode(`Content of test file number ${i}`);
+      vfs.addFile('/LARGE_DIR', `file_item_test_document_${i.toString().padStart(3, '0')}.txt`, content);
+    }
+
+    const isoBlob = await vfs.buildImageBlob();
+    expect(isoBlob.size).toBeGreaterThan(0);
+
+    const reader = new BlobReader(isoBlob);
+    const parser = new IsoParser(reader);
+    const { root } = await parser.parse();
+
+    const largeDir = root.children?.find((c) => c.name === 'LARGE_DIR');
+    expect(largeDir).toBeDefined();
+    expect(largeDir?.children?.length).toBe(65);
+  });
 });
 
 describe('FAT12 Floppy Image Builder and Parser', () => {

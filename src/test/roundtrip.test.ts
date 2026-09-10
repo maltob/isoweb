@@ -42,6 +42,68 @@ describe('End-to-end Roundtrip Editing & Saving', () => {
     expect(new TextDecoder().decode(secondBytes)).toBe('Content of second file');
   });
 
+  it('should preserve exact SHA-256 file hashes across ISO creation and extraction', async () => {
+    const crypto = await import('crypto');
+    const sha256 = (bytes: Uint8Array) => crypto.createHash('sha256').update(bytes).digest('hex');
+
+    const vfs = VirtualFS.createNew('iso', 'HASH_TEST');
+
+    // 1. Zero-byte file
+    const zeroBytes = new Uint8Array(0);
+    const zeroHash = sha256(zeroBytes);
+    vfs.addFile('/', 'EMPTY.DAT', zeroBytes);
+
+    // 2. Small binary file
+    const smallBytes = new Uint8Array(1234);
+    for (let i = 0; i < smallBytes.length; i++) smallBytes[i] = (i * 37 + 13) & 0xff;
+    const smallHash = sha256(smallBytes);
+    vfs.addFile('/', 'SMALL.BIN', smallBytes);
+
+    // 3. Medium file crossing sector boundary (e.g. 5000 bytes = 2 sectors + 904 bytes)
+    const medBytes = new Uint8Array(5000);
+    for (let i = 0; i < medBytes.length; i++) medBytes[i] = (i * 73 + 19) & 0xff;
+    const medHash = sha256(medBytes);
+    vfs.addFile('/', 'MEDIUM.BIN', medBytes);
+
+    // 4. Large file crossing 2MB chunk buffer (2.5 MB)
+    const largeBytes = new Uint8Array(2.5 * 1024 * 1024);
+    for (let i = 0; i < largeBytes.length; i += 1024) {
+      largeBytes[i] = (i & 0xff);
+    }
+    const largeHash = sha256(largeBytes);
+    vfs.addFile('/', 'LARGE.BIN', largeBytes);
+
+    // Build ISO
+    const isoBlob = await vfs.buildImageBlob();
+
+    // Load ISO back
+    const vfsLoaded = await DiskImageLoader.load(new BlobReader(isoBlob), 'test.iso');
+
+    // Verify empty file
+    const emptyNode = vfsLoaded.findNode('/EMPTY.DAT')!;
+    expect(emptyNode).toBeDefined();
+    const loadedZeroBytes = await vfsLoaded.getFileBytes(emptyNode);
+    expect(sha256(loadedZeroBytes)).toBe(zeroHash);
+
+    // Verify small file
+    const smallNode = vfsLoaded.findNode('/SMALL.BIN')!;
+    expect(smallNode).toBeDefined();
+    const loadedSmallBytes = await vfsLoaded.getFileBytes(smallNode);
+    expect(sha256(loadedSmallBytes)).toBe(smallHash);
+
+    // Verify medium file
+    const medNode = vfsLoaded.findNode('/MEDIUM.BIN')!;
+    expect(medNode).toBeDefined();
+    const loadedMedBytes = await vfsLoaded.getFileBytes(medNode);
+    expect(sha256(loadedMedBytes)).toBe(medHash);
+
+    // Verify large file
+    const largeNode = vfsLoaded.findNode('/LARGE.BIN')!;
+    expect(largeNode).toBeDefined();
+    const loadedLargeBytes = await vfsLoaded.getFileBytes(largeNode);
+    expect(sha256(loadedLargeBytes)).toBe(largeHash);
+  });
+
   it('should roundtrip edit and preserve files in a FAT12 floppy image', async () => {
     // 1. Create floppy
     const vfs1 = VirtualFS.createNew('fat12', 'BOOT_FLP');

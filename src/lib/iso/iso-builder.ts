@@ -102,7 +102,7 @@ export class IsoBuilder {
       await this.streamFileData(fileInfo.node, writer);
 
       // Sector alignment padding (2048-byte sector boundary)
-      const padBytes = (ISO_SECTOR_SIZE - (fileInfo.size % ISO_SECTOR_SIZE)) % ISO_SECTOR_SIZE;
+      const padBytes = fileInfo.size === 0 ? 0 : (ISO_SECTOR_SIZE - (fileInfo.size % ISO_SECTOR_SIZE)) % ISO_SECTOR_SIZE;
       if (padBytes > 0) {
         await writer.write(new Uint8Array(padBytes));
       }
@@ -137,7 +137,13 @@ export class IsoBuilder {
       return;
     }
 
-    // Case 2: From existing ISO image reader (zero-copy lazy stream)
+    // Case 2: In-memory byte array (takes precedence if file was edited/modified)
+    if (node.data && node.data.length > 0) {
+      await writer.write(node.data);
+      return;
+    }
+
+    // Case 3: From existing ISO image reader (zero-copy lazy stream)
     if (this.sourceReader && node.sourceSector !== undefined && node.sourceLength !== undefined) {
       const startByte = node.sourceSector * ISO_SECTOR_SIZE;
       const totalLen = node.sourceLength;
@@ -148,12 +154,6 @@ export class IsoBuilder {
         await writer.write(chunk);
         offset += len;
       }
-      return;
-    }
-
-    // Case 3: In-memory byte array
-    if (node.data && node.data.length > 0) {
-      await writer.write(node.data);
       return;
     }
   }
@@ -239,8 +239,8 @@ export class IsoBuilder {
         if (child.isDirectory) {
           collectFiles(child);
         } else {
-          const fileSize = child.data?.length ?? child.size ?? 0;
-          const fileSectors = Math.max(1, Math.ceil(fileSize / ISO_SECTOR_SIZE));
+          const fileSize = child.fileRef?.size ?? child.data?.byteLength ?? child.sourceLength ?? child.size ?? 0;
+          const fileSectors = Math.ceil(fileSize / ISO_SECTOR_SIZE);
           files.push({
             node: child,
             sector: currentSector,
@@ -440,7 +440,9 @@ export class IsoBuilder {
     isJoliet: boolean,
     isLittleEndian: boolean
   ): Uint8Array {
-    const buffer = new Uint8Array(ISO_SECTOR_SIZE);
+    const tableSize = this.getPathTableSize(directories, isJoliet);
+    const bufferSize = Math.max(ISO_SECTOR_SIZE, Math.ceil(tableSize / ISO_SECTOR_SIZE) * ISO_SECTOR_SIZE);
+    let buffer = new Uint8Array(bufferSize);
     let offset = 0;
 
     for (let i = 0; i < directories.length; i++) {
@@ -448,6 +450,13 @@ export class IsoBuilder {
       const sector = isJoliet ? dir.jolietSector : dir.pvdSector;
       const name = i === 0 ? '\0' : dir.node.name;
       const idLen = i === 0 ? 1 : isJoliet ? name.length * 2 : name.length;
+      const recLen = 8 + idLen + (idLen % 2);
+
+      if (offset + recLen > buffer.length) {
+        const newBuffer = new Uint8Array(buffer.length + ISO_SECTOR_SIZE);
+        newBuffer.set(buffer);
+        buffer = newBuffer;
+      }
 
       buffer[offset] = idLen;
       buffer[offset + 1] = 0; // Extended attribute length
@@ -490,7 +499,7 @@ export class IsoBuilder {
     isJoliet: boolean
   ): Uint8Array {
     const totalSize = isJoliet ? dir.jolietSize : dir.pvdSize;
-    const buffer = new Uint8Array(totalSize);
+    let buffer = new Uint8Array(totalSize);
     let offset = 0;
 
     const selfSector = isJoliet ? dir.jolietSector : dir.pvdSector;
@@ -544,23 +553,22 @@ export class IsoBuilder {
         }
       }
 
-      let nameBytes: Uint8Array;
-      if (isJoliet) {
-        nameBytes = this.encodeUcs2BE(child.name);
-      } else {
-        const cleanName = child.name.toUpperCase().replace(/[^A-Z0-9_.]/g, '_');
-        const formatted = child.isDirectory ? cleanName : `${cleanName};1`;
-        nameBytes = new Uint8Array([...formatted].map((c) => c.charCodeAt(0)));
-      }
-
-      const recLen = 33 + nameBytes.length + (nameBytes.length % 2 === 0 ? 1 : 0);
-      const alignedRecLen = recLen + (recLen % 2);
+      const fileIdBytes = this.getChildFileIdBytes(child, isJoliet);
+      const recLen = this.computeRecordLength(fileIdBytes.length);
 
       // Check if entry crosses sector boundary
       const currentSectorOffset = offset % ISO_SECTOR_SIZE;
-      if (currentSectorOffset + alignedRecLen > ISO_SECTOR_SIZE) {
+      if (currentSectorOffset + recLen > ISO_SECTOR_SIZE) {
         // Pad rest of current sector with 0s and jump to next sector
         offset = Math.ceil(offset / ISO_SECTOR_SIZE) * ISO_SECTOR_SIZE;
+      }
+
+      // Safeguard: Ensure buffer has enough space
+      if (offset + recLen > buffer.length) {
+        const newTotal = Math.ceil((offset + recLen) / ISO_SECTOR_SIZE) * ISO_SECTOR_SIZE;
+        const newBuffer = new Uint8Array(newTotal);
+        newBuffer.set(buffer);
+        buffer = newBuffer;
       }
 
       offset += this.writeDirectoryRecord(
@@ -568,7 +576,7 @@ export class IsoBuilder {
         childSector,
         childLength,
         child.isDirectory,
-        nameBytes,
+        fileIdBytes,
         child.modifiedTime
       );
     }
