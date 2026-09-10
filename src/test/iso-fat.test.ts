@@ -172,4 +172,79 @@ describe('FAT16 & FAT32 Disk Image Builder', () => {
     const data = await parser.readFileData(file!);
     expect(new TextDecoder().decode(data)).toBe('FAT16 test!');
   });
+
+  it('should build and parse a 512MB FAT16 disk image', async () => {
+    const vfs = VirtualFS.createNew('fat16', 'FAT16_512', '512');
+    vfs.addFile('/', 'HELLO.TXT', new TextEncoder().encode('512MB FAT16 file'));
+    const blob = await vfs.buildImageBlob();
+    const parser = new FatParser(new BlobReader(blob));
+    const { root, info } = await parser.parse();
+    expect(info.format).toBe('fat16');
+    const file = root.children?.find((c) => c.name === 'HELLO.TXT');
+    expect(file).toBeDefined();
+  });
+
+  it('should build and parse a 32MB FAT32 disk image', async () => {
+    const vfs = VirtualFS.createNew('fat32', 'FAT32_32', '32');
+    vfs.addFile('/', 'HELLO.TXT', new TextEncoder().encode('32MB FAT32 file'));
+    const blob = await vfs.buildImageBlob();
+    const parser = new FatParser(new BlobReader(blob));
+    const { root, info } = await parser.parse();
+    expect(info.format).toBe('fat32');
+    const file = root.children?.find((c) => c.name === 'HELLO.TXT');
+    expect(file).toBeDefined();
+  });
+
+  it('should build and parse an MBR-partitioned FAT32 hard disk image', async () => {
+    const rootNode: VNode = {
+      id: 'root',
+      name: '/',
+      path: '/',
+      isDirectory: true,
+      size: 0,
+      modifiedTime: new Date(),
+      children: [
+        {
+          id: 'nested-dir',
+          name: 'SYSTEM',
+          path: '/SYSTEM',
+          isDirectory: true,
+          size: 0,
+          modifiedTime: new Date(),
+          children: [
+            {
+              id: 'kernel-file',
+              name: 'KERNEL.SYS',
+              path: '/SYSTEM/KERNEL.SYS',
+              isDirectory: false,
+              size: 16,
+              modifiedTime: new Date(),
+              data: new TextEncoder().encode('OS KERNEL BINARY'),
+            },
+          ],
+        },
+      ],
+    };
+
+    const builder = new FatBuilder(rootNode, {
+      fatType: FatType.FAT32,
+      volumeLabel: 'MBR_DISK',
+      totalSectors: 131072, // 64MB
+      hasMbr: true,
+    });
+
+    const blob = await builder.buildBlob();
+    const reader = new BlobReader(blob);
+    const parser = new FatParser(reader);
+    const { root, info } = await parser.parse();
+
+    expect(info.hasMbr).toBe(true);
+    expect(info.format).toBe('fat32');
+    const sysDir = root.children?.find((c) => c.name === 'SYSTEM');
+    expect(sysDir).toBeDefined();
+    const kernel = sysDir?.children?.find((c) => c.name === 'KERNEL.SYS');
+    expect(kernel).toBeDefined();
+    const data = await parser.readFileData(kernel!);
+    expect(new TextDecoder().decode(data)).toBe('OS KERNEL BINARY');
+  });
 });

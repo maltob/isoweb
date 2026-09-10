@@ -1,13 +1,14 @@
 // Helper to recursively extract all files and subdirectories from drag-and-drop or folder pickers
 
 export interface DroppedFileEntry {
-  file: File;
-  relativePath: string; // e.g. "MyFolder/Sub/document.txt"
+  isDirectory?: boolean;
+  file?: File;
+  relativePath: string; // e.g. "MyEmptyFolder" or "MyFolder/document.txt"
 }
 
 /**
- * Recursively extracts all files from a drag-and-drop DataTransfer object.
- * Uses webkitGetAsEntry() to properly walk folders and subfolders.
+ * Recursively extracts all files and subdirectories from a drag-and-drop DataTransfer object.
+ * Uses webkitGetAsEntry() to properly walk folders and subfolders, preserving empty directories.
  */
 export async function extractEntriesFromDataTransfer(
   dataTransfer: DataTransfer
@@ -27,12 +28,15 @@ export async function extractEntriesFromDataTransfer(
             entry.file(resolve, reject);
           });
           const relPath = basePath ? `${basePath}/${file.name}` : file.name;
-          results.push({ file, relativePath: relPath });
+          results.push({ isDirectory: false, file, relativePath: relPath });
         } catch (err) {
           console.warn('Could not read file entry:', entry.name, err);
         }
       } else if (entry.isDirectory) {
         const dirPath = basePath ? `${basePath}/${entry.name}` : entry.name;
+        // Always record the directory itself so empty folders are preserved
+        results.push({ isDirectory: true, relativePath: dirPath });
+
         const dirReader = entry.createReader();
 
         // WebKit requires calling readEntries() repeatedly until an empty array is returned
@@ -68,7 +72,7 @@ export async function extractEntriesFromDataTransfer(
         } else {
           const file = item.getAsFile();
           if (file) {
-            results.push({ file, relativePath: file.name });
+            results.push({ isDirectory: false, file, relativePath: file.name });
           }
         }
       }
@@ -85,6 +89,7 @@ export async function extractEntriesFromDataTransfer(
     for (let i = 0; i < dataTransfer.files.length; i++) {
       const file = dataTransfer.files[i];
       results.push({
+        isDirectory: false,
         file,
         relativePath: file.webkitRelativePath || file.name,
       });
@@ -95,7 +100,8 @@ export async function extractEntriesFromDataTransfer(
 }
 
 /**
- * Recursively extracts all files from a directory handle (File System Access API)
+ * Recursively extracts all files and directories from a directory handle (File System Access API)
+ * Preserves empty directories by yielding directory entries directly.
  */
 export async function readDirectoryHandle(
   dirHandle: FileSystemDirectoryHandle,
@@ -104,11 +110,18 @@ export async function readDirectoryHandle(
   const results: DroppedFileEntry[] = [];
   const currentPath = basePath ? `${basePath}/${dirHandle.name}` : dirHandle.name;
 
+  // Always record this directory itself so empty directories are not lost
+  results.push({
+    isDirectory: true,
+    relativePath: currentPath,
+  });
+
   // @ts-expect-error entries() is standard on FileSystemDirectoryHandle
   for await (const [name, handle] of dirHandle.entries()) {
     if (handle.kind === 'file') {
       const file = await (handle as FileSystemFileHandle).getFile();
       results.push({
+        isDirectory: false,
         file,
         relativePath: `${currentPath}/${name}`,
       });

@@ -42,4 +42,51 @@ describe('VirtualFS Editing & ZIP Archiving', () => {
     expect(dir1).toBeDefined();
     expect(dir1?.children?.find((c) => c.name === 'sub.txt')).toBeDefined();
   });
+
+  it('should support building disk images with empty folders without getting stuck', async () => {
+    // 1. ISO with empty folders
+    const isoVfs = VirtualFS.createNew('iso', 'EMPTY_ISO');
+    isoVfs.createDirectory('/', 'EMPTY_DIR');
+    isoVfs.createDirectory('/EMPTY_DIR', 'NESTED_EMPTY');
+    const isoBlob = await isoVfs.buildImageBlob();
+    expect(isoBlob.size).toBeGreaterThan(0);
+
+    const isoParser = new IsoParser(new BlobReader(isoBlob));
+    const { root: isoRoot } = await isoParser.parse();
+    const emptyDir = isoRoot.children?.find((c) => c.name === 'EMPTY_DIR');
+    expect(emptyDir).toBeDefined();
+    expect(emptyDir?.isDirectory).toBe(true);
+    expect(emptyDir?.children?.find((c) => c.name === 'NESTED_EMPTY')).toBeDefined();
+
+    // 2. FAT32 with empty folders
+    const fatVfs = VirtualFS.createNew('fat32', 'EMPTY_FAT', '64');
+    fatVfs.createDirectory('/', 'EMPTY_DIR');
+    fatVfs.createDirectory('/EMPTY_DIR', 'NESTED_EMPTY');
+    const fatBlob = await fatVfs.buildImageBlob();
+    expect(fatBlob.size).toBe(64 * 1024 * 1024);
+
+    // 3. VMDK with empty folders
+    const vmdkVfs = VirtualFS.createNew('vmdk-fat32', 'EMPTY_VMDK', '512');
+    vmdkVfs.createDirectory('/', 'EMPTY_DIR');
+    const vmdkBlob = await vmdkVfs.buildImageBlob();
+    expect(vmdkBlob.size).toBeGreaterThan(0);
+  });
+
+  it('should extract empty directory entries from readDirectoryHandle without stalling', async () => {
+    const { readDirectoryHandle } = await import('../lib/drop-handler');
+
+    // Mock empty directory handle
+    const mockEmptyDir: any = {
+      name: 'EmptyFolder',
+      kind: 'directory',
+      entries: async function* () {
+        // Yields no entries (empty directory)
+      },
+    };
+
+    const entries = await readDirectoryHandle(mockEmptyDir);
+    expect(entries.length).toBe(1);
+    expect(entries[0].isDirectory).toBe(true);
+    expect(entries[0].relativePath).toBe('EmptyFolder');
+  });
 });

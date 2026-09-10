@@ -1,4 +1,6 @@
 // Virtual Filesystem & State Controller for active disk image
+import { ExFatBuilder } from '../exfat/exfat-builder';
+import { ExFatParser } from '../exfat/exfat-parser';
 import { FatBuilder } from '../fat/fat-builder';
 import { FatParser } from '../fat/fat-parser';
 import { FatType } from '../fat/fat-types';
@@ -6,8 +8,9 @@ import { IsoBuilder } from '../iso/iso-builder';
 import { ISO_SECTOR_SIZE } from '../iso/iso-types';
 import { RandomAccessReader } from '../reader';
 import { OpfsManager } from '../storage/opfs';
-import { FileSystemAccessStreamWriter, ImageStreamWriter } from '../storage/stream-writer';
+import { BlobAccumulatorWriter, FileSystemAccessStreamWriter, ImageStreamWriter } from '../storage/stream-writer';
 import { DiskFormat, DiskImageInfo, VNode } from '../types';
+import { VmdkBuilder } from '../vmdk/vmdk-builder';
 import { ZipArchiver } from './zip-export';
 
 export class VirtualFS {
@@ -16,19 +19,22 @@ export class VirtualFS {
   private imageInfo: DiskImageInfo;
   private sourceReader?: RandomAccessReader;
   private sourceFatParser?: FatParser;
+  private sourceExFatParser?: ExFatParser;
 
   constructor(
     root: VNode,
     format: DiskFormat,
     imageInfo: DiskImageInfo,
     sourceReader?: RandomAccessReader,
-    sourceFatParser?: FatParser
+    sourceFatParser?: FatParser,
+    sourceExFatParser?: ExFatParser
   ) {
     this.root = root;
     this.format = format;
     this.imageInfo = imageInfo;
     this.sourceReader = sourceReader;
     this.sourceFatParser = sourceFatParser;
+    this.sourceExFatParser = sourceExFatParser;
   }
 
   getRoot(): VNode {
@@ -53,7 +59,8 @@ export class VirtualFS {
   static createNew(
     format: DiskFormat,
     volumeLabel: string = 'NEW_DISK',
-    sizePreset?: string
+    sizePreset?: string,
+    hasMbr?: boolean
   ): VirtualFS {
     const rootNode: VNode = {
       id: 'root',
@@ -94,7 +101,24 @@ export class VirtualFS {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 512;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
       formatName = `FAT32 Disk Image (${mb}MB)`;
+    } else if (format === 'exfat') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `exFAT Disk Image (${mb}MB)`;
+    } else if (format === 'vmdk-fat32') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VMDK Virtual Disk - FAT32 (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vmdk-exfat') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VMDK Virtual Disk - exFAT (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
     }
+
+    const isMbrFormat =
+      hasMbr !== undefined
+        ? hasMbr
+        : format === 'fat16' || format === 'fat32' || format.startsWith('vmdk');
 
     const info: DiskImageInfo = {
       format,
@@ -106,6 +130,7 @@ export class VirtualFS {
       clusterSize: format === 'iso' ? undefined : 512,
       hasJoliet: format === 'iso',
       isBootable: false,
+      hasMbr: isMbrFormat,
     };
 
     return new VirtualFS(rootNode, format, info);
@@ -280,6 +305,11 @@ export class VirtualFS {
       return await this.sourceFatParser.readFileData(node);
     }
 
+    // From exFAT source
+    if (this.sourceExFatParser && node.startCluster !== undefined) {
+      return await this.sourceExFatParser.readFileData(node);
+    }
+
     return new Uint8Array(0);
   }
 
@@ -291,7 +321,17 @@ export class VirtualFS {
     writer: ImageStreamWriter,
     onProgress?: (ratio: number, status: string) => void
   ): Promise<void> {
-    if (this.format === 'iso') {
+    if (this.format === 'vmdk-fat32' || this.format === 'vmdk-exfat') {
+      const builder = new VmdkBuilder(this.root, {
+        fsType: this.format === 'vmdk-fat32' ? 'fat32' : 'exfat',
+        volumeLabel: this.imageInfo.volumeLabel,
+        capacitySectors: this.imageInfo.totalSectors || 2097152,
+      });
+      await builder.buildToStream(writer, onProgress);
+    } else if (this.format === 'exfat') {
+      const builder = new ExFatBuilder(this.root, this.imageInfo.volumeLabel, this.imageInfo.totalSectors);
+      await builder.buildToStream(writer, onProgress);
+    } else if (this.format === 'iso') {
       const builder = new IsoBuilder(
         this.root,
         {
@@ -315,6 +355,7 @@ export class VirtualFS {
           fatType,
           volumeLabel: this.imageInfo.volumeLabel,
           totalSectors: this.imageInfo.totalSectors,
+          hasMbr: this.imageInfo.hasMbr,
         },
         this.sourceFatParser
       );
@@ -358,7 +399,19 @@ export class VirtualFS {
    * Builds and exports the disk image as a Blob
    */
   async buildImageBlob(onProgress?: (ratio: number, status: string) => void): Promise<Blob> {
-    if (this.format === 'iso') {
+    if (this.format === 'vmdk-fat32' || this.format === 'vmdk-exfat') {
+      const builder = new VmdkBuilder(this.root, {
+        fsType: this.format === 'vmdk-fat32' ? 'fat32' : 'exfat',
+        volumeLabel: this.imageInfo.volumeLabel,
+        capacitySectors: this.imageInfo.totalSectors || 2097152,
+      });
+      return await builder.buildBlob(onProgress);
+    } else if (this.format === 'exfat') {
+      const builder = new ExFatBuilder(this.root, this.imageInfo.volumeLabel, this.imageInfo.totalSectors);
+      const acc = new BlobAccumulatorWriter('application/octet-stream');
+      await builder.buildToStream(acc, onProgress);
+      return acc.getBlob();
+    } else if (this.format === 'iso') {
       const builder = new IsoBuilder(
         this.root,
         {
@@ -382,6 +435,7 @@ export class VirtualFS {
           fatType,
           volumeLabel: this.imageInfo.volumeLabel,
           totalSectors: this.imageInfo.totalSectors,
+          hasMbr: this.imageInfo.hasMbr,
         },
         this.sourceFatParser
       );

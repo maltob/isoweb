@@ -81,6 +81,27 @@ export const Header: React.FC<HeaderProps> = ({
             FAT32 Disk
           </span>
         );
+      case 'exfat':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-teal-500/20 text-teal-300 border border-teal-500/30">
+            <HardDrive className="w-3.5 h-3.5" />
+            exFAT Disk
+          </span>
+        );
+      case 'vmdk-fat32':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-violet-500/20 text-violet-300 border border-violet-500/30">
+            <HardDrive className="w-3.5 h-3.5" />
+            VMDK (FAT32)
+          </span>
+        );
+      case 'vmdk-exfat':
+        return (
+          <span className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full text-xs font-semibold bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+            <HardDrive className="w-3.5 h-3.5" />
+            VMDK (exFAT)
+          </span>
+        );
     }
   };
 
@@ -90,7 +111,7 @@ export const Header: React.FC<HeaderProps> = ({
         type="file"
         ref={fileInputRef}
         onChange={handleFileChange}
-        accept=".iso,.img,.ima,.vfd,.flp,.bin,.raw"
+        accept=".iso,.img,.ima,.vfd,.flp,.bin,.raw,.vmdk"
         className="hidden"
       />
 
@@ -179,7 +200,9 @@ export const Header: React.FC<HeaderProps> = ({
                 >
                   <Download className="w-4 h-4 text-sky-400" />
                   <div>
-                    <div className="font-semibold">Download {imageInfo.format === 'iso' ? '.ISO' : '.IMG'}</div>
+                    <div className="font-semibold">
+                      Download {imageInfo.format.startsWith('vmdk') ? '.VMDK' : imageInfo.format === 'iso' ? '.ISO' : '.IMG'}
+                    </div>
                     <div className="text-[11px] text-slate-400">Save disk image to your computer</div>
                   </div>
                 </button>

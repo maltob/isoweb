@@ -1,6 +1,6 @@
 // Core types for VM Disk Image builder and explorer
 
-export type DiskFormat = 'iso' | 'fat12' | 'fat16' | 'fat32';
+export type DiskFormat = 'iso' | 'fat12' | 'fat16' | 'fat32' | 'exfat' | 'vmdk-fat32' | 'vmdk-exfat';
 
 export interface FileMetadata {
   name: string;

@@ -130,9 +130,14 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
   };
 
   // Create new image
-  const handleCreateNew = (format: DiskFormat, volumeLabel: string, sizePreset?: string) => {
-    const newVfs = VirtualFS.createNew(format, volumeLabel, sizePreset);
-    const ext = format === 'iso' ? '.iso' : '.img';
+  const handleCreateNew = (
+    format: DiskFormat,
+    volumeLabel: string,
+    sizePreset?: string,
+    hasMbr?: boolean
+  ) => {
+    const newVfs = VirtualFS.createNew(format, volumeLabel, sizePreset, hasMbr);
+    const ext = format === 'iso' ? '.iso' : format.startsWith('vmdk') ? '.vmdk' : '.img';
     setVfs(newVfs);
     setCurrentFileName(`${volumeLabel.toLowerCase()}${ext}`);
     setCurrentPath('/');
@@ -141,17 +146,25 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
 
   // Download / Save to computer (Streams directly to hard drive with File System Access API)
   const handleSaveImage = async () => {
+    const format = vfs.getFormat();
+    const ext = format === 'iso' ? '.iso' : format.startsWith('vmdk') ? '.vmdk' : '.img';
+    const description = format.startsWith('vmdk')
+      ? 'VMware / VirtualBox VMDK Virtual Disk'
+      : format === 'iso'
+      ? 'ISO 9660 Disc Image'
+      : 'Raw VM Disk Image';
+
     // Check if File System Access API is available for direct disk streaming
     if ('showSaveFilePicker' in window) {
       try {
-        const ext = vfs.getFormat() === 'iso' ? '.iso' : '.img';
-        const defaultName = currentFileName.endsWith(ext) ? currentFileName : `${currentFileName}${ext}`;
+        const baseName = currentFileName.replace(/\.[^/.]+$/, '');
+        const defaultName = currentFileName.endsWith(ext) ? currentFileName : `${baseName}${ext}`;
         // @ts-expect-error showSaveFilePicker is standard in Chromium/Edge
         const fileHandle: FileSystemFileHandle = await window.showSaveFilePicker({
           suggestedName: defaultName,
           types: [
             {
-              description: vfs.getFormat() === 'iso' ? 'ISO 9660 Disc Image' : 'Raw VM Disk Image',
+              description,
               accept: {
                 'application/octet-stream': [ext],
               },
@@ -220,48 +233,65 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
     }
   };
 
-  // Add a list of dropped or selected file entries (supporting full directory hierarchies)
+  // Add a list of dropped or selected file/folder entries (supporting full directory hierarchies and empty folders)
   const handleAddDroppedEntries = async (entries: DroppedFileEntry[]) => {
-    if (entries.length === 0) return;
+    if (entries.length === 0) {
+      setProgressState({ visible: false, ratio: 0, status: '' });
+      return;
+    }
 
     setProgressState({
       visible: true,
       ratio: 0,
-      status: `Staging ${entries.length} file(s)...`,
+      status: `Staging ${entries.length} item(s)...`,
     });
 
-    for (let i = 0; i < entries.length; i++) {
-      const entry = entries[i];
-      setProgressState({
-        visible: true,
-        ratio: (i + 1) / entries.length,
-        status: `Staging (${i + 1}/${entries.length}): ${entry.file.name}`,
-      });
+    try {
+      for (let i = 0; i < entries.length; i++) {
+        const entry = entries[i];
+        const displayName = entry.file
+          ? entry.file.name
+          : entry.relativePath.split('/').pop() || 'folder';
 
-      // Split relativePath to create parent directories if needed
-      // e.g. "MyFolder/sub/file.txt" -> ["MyFolder", "sub"], fileName = "file.txt"
-      const parts = entry.relativePath.split('/').filter(Boolean);
-      const fileName = parts.pop() || entry.file.name;
+        setProgressState({
+          visible: true,
+          ratio: (i + 1) / entries.length,
+          status: `Staging (${i + 1}/${entries.length}): ${displayName}`,
+        });
 
-      let targetPath = currentPath;
-      for (const part of parts) {
-        vfs.createDirectory(targetPath, part);
-        targetPath = targetPath === '/' ? `/${part}` : `${targetPath}/${part}`;
+        const parts = entry.relativePath.split('/').filter(Boolean);
+
+        if (entry.isDirectory) {
+          // Directory entry: ensure every directory in the path is created
+          let targetPath = currentPath;
+          for (const part of parts) {
+            vfs.createDirectory(targetPath, part);
+            targetPath = targetPath === '/' ? `/${part}` : `${targetPath}/${part}`;
+          }
+        } else if (entry.file) {
+          // File entry: ensure parent directories are created, then add file
+          const fileName = parts.pop() || entry.file.name;
+          let targetPath = currentPath;
+          for (const part of parts) {
+            vfs.createDirectory(targetPath, part);
+            targetPath = targetPath === '/' ? `/${part}` : `${targetPath}/${part}`;
+          }
+
+          // Zero-RAM addition: attach entry.file as a lazy File pointer instead of reading arrayBuffer into RAM!
+          vfs.addFile(targetPath, fileName, undefined, new Date(entry.file.lastModified), entry.file);
+        }
       }
-
-      // Zero-RAM addition: attach entry.file as a lazy File pointer instead of reading arrayBuffer into RAM!
-      vfs.addFile(targetPath, fileName, undefined, new Date(entry.file.lastModified), entry.file);
+    } finally {
+      setProgressState({ visible: false, ratio: 1, status: 'Done' });
+      forceUpdate();
     }
-
-    setProgressState({ visible: false, ratio: 1, status: 'Done' });
-    forceUpdate();
   };
 
   // Add files
   const handleAddFiles = async (files: FileList) => {
     const entries: DroppedFileEntry[] = [];
     for (let i = 0; i < files.length; i++) {
-      entries.push({ file: files[i], relativePath: files[i].name });
+      entries.push({ isDirectory: false, file: files[i], relativePath: files[i].name });
     }
     await handleAddDroppedEntries(entries);
   };
@@ -272,6 +302,7 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
       entries.push({
+        isDirectory: false,
         file,
         relativePath: file.webkitRelativePath || file.name,
       });
@@ -300,7 +331,8 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
         lower.endsWith('.iso') ||
         lower.endsWith('.img') ||
         lower.endsWith('.ima') ||
-        lower.endsWith('.vfd')
+        lower.endsWith('.vfd') ||
+        lower.endsWith('.vmdk')
       ) {
         if (confirm(`Would you like to open "${first.name}" as a VM disk image?`)) {
           handleOpenFile(first);
@@ -309,9 +341,14 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
       }
     }
 
-    setProgressState({ visible: true, ratio: 0.1, status: 'Scanning folder contents...' });
-    const entries = await extractEntriesFromDataTransfer(dataTransfer);
-    await handleAddDroppedEntries(entries);
+    try {
+      setProgressState({ visible: true, ratio: 0.1, status: 'Scanning folder contents...' });
+      const entries = await extractEntriesFromDataTransfer(dataTransfer);
+      await handleAddDroppedEntries(entries);
+    } catch (e) {
+      setProgressState({ visible: false, ratio: 0, status: '' });
+      alert(`Failed to process dropped items: ${e}`);
+    }
   };
 
   // Create folder prompt

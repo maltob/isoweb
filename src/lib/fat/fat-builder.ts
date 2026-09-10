@@ -13,6 +13,8 @@ export interface FatBuilderOptions {
   volumeLabel?: string;
   totalSectors?: number; // default 2880 for FAT12 (1.44M)
   sectorsPerCluster?: number;
+  hasMbr?: boolean;
+  hiddenSectors?: number;
 }
 
 interface AllocatedItem {
@@ -51,17 +53,63 @@ export class FatBuilder {
     onProgress?.(0.05, 'Configuring FAT filesystem geometry...');
     const geo = this.computeGeometry();
 
-    // 1. Write Boot Sector (BPB) & reserved sectors
-    onProgress?.(0.1, 'Writing boot sector and BPB...');
-    const reservedBytes = new Uint8Array(geo.reservedSectors * geo.bytesPerSector);
-    this.writeBootSector(reservedBytes, geo);
-    await writer.write(reservedBytes);
-
-    // 2. Allocate clusters for all files and directories
-    onProgress?.(0.2, 'Allocating cluster map...');
+    // 1. Allocate clusters for all files and directories first
+    onProgress?.(0.1, 'Allocating cluster map...');
     const allocation = await this.allocateClusters(geo);
 
-    // 3. Generate FAT tables (FAT1 and mirror FAT2)
+    // 2. If MBR requested, write MBR Sector 0 and padding up to Partition 1
+    if (geo.hasMbr) {
+      onProgress?.(0.15, 'Writing MBR partition table...');
+      const mbrSector = new Uint8Array(geo.bytesPerSector);
+      // Partition 1 Entry at offset 446 (0x1BE)
+      mbrSector[446] = 0x80; // Active / bootable
+      mbrSector[447] = 0x00; // Start Head
+      mbrSector[448] = 0x02; // Start Sector
+      mbrSector[449] = 0x00; // Start Cylinder
+      mbrSector[450] =
+        geo.fatType === FatType.FAT32
+          ? 0x0c
+          : geo.totalSectors > 65536
+          ? 0x0e
+          : 0x06; // Partition Type (0x0C = FAT32 LBA, 0x0E = FAT16 LBA, 0x06 = FAT16)
+      mbrSector[451] = 0xfe; // End Head
+      mbrSector[452] = 0xff; // End Sector
+      mbrSector[453] = 0xff; // End Cylinder
+      this.writeUint32LE(mbrSector, 454, geo.hiddenSectors); // Starting LBA
+      this.writeUint32LE(mbrSector, 458, geo.partitionSectors); // Sector Count
+      mbrSector[510] = 0x55;
+      mbrSector[511] = 0xaa;
+      await writer.write(mbrSector);
+
+      // Pad sectors 1 to (geo.hiddenSectors - 1)
+      const padBytes = (geo.hiddenSectors - 1) * geo.bytesPerSector;
+      if (padBytes > 0) {
+        const zeroChunk = new Uint8Array(Math.min(65536, padBytes));
+        let rem = padBytes;
+        while (rem > 0) {
+          const toWrite = Math.min(zeroChunk.byteLength, rem);
+          await writer.write(toWrite === zeroChunk.byteLength ? zeroChunk : zeroChunk.subarray(0, toWrite));
+          rem -= toWrite;
+        }
+      }
+    }
+
+    // 3. Write Boot Sector (BPB), FSInfo, and reserved sectors
+    onProgress?.(0.2, 'Writing boot sector and BPB...');
+    const reservedBytes = new Uint8Array(geo.reservedSectors * geo.bytesPerSector);
+    this.writeBootSector(reservedBytes, geo);
+    if (geo.fatType === FatType.FAT32) {
+      const freeClusters = Math.max(0, geo.totalClusters - allocation.allocatedClusterCount);
+      // Primary FSInfo at Sector 1
+      this.writeFsInfoSector(reservedBytes, 1, geo, freeClusters, allocation.nextFreeCluster);
+      // Backup Boot Sector at Sector 6 (copy of Sector 0)
+      reservedBytes.set(reservedBytes.subarray(0, 512), 6 * geo.bytesPerSector);
+      // Backup FSInfo at Sector 7 (copy of Sector 1)
+      reservedBytes.set(reservedBytes.subarray(512, 1024), 7 * geo.bytesPerSector);
+    }
+    await writer.write(reservedBytes);
+
+    // 4. Generate FAT tables (FAT1 and mirror FAT2)
     onProgress?.(0.3, 'Writing File Allocation Table 1...');
     const fatBytes = this.generateFatBytes(geo, allocation.fatTable);
     await writer.write(fatBytes);
@@ -69,14 +117,14 @@ export class FatBuilder {
     onProgress?.(0.4, 'Writing File Allocation Table 2 (mirror)...');
     await writer.write(fatBytes);
 
-    // 4. Fixed Root Directory (FAT12 / FAT16)
+    // 5. Fixed Root Directory (FAT12 / FAT16)
     if (geo.fatType !== FatType.FAT32) {
       onProgress?.(0.45, 'Writing root directory table...');
       const rootBytes = this.generateFixedRootDirBytes(geo, allocation);
       await writer.write(rootBytes);
     }
 
-    // 5. Stream cluster data sequentially (Cluster 2 up to totalClusters)
+    // 6. Stream cluster data sequentially (Cluster 2 up to totalClusters)
     onProgress?.(0.5, 'Streaming clusters (directories & files)...');
     await this.streamAllClusters(writer, geo, allocation, onProgress);
 
@@ -272,8 +320,13 @@ export class FatBuilder {
         dirNode.modifiedTime
       );
 
-      // '..' (parent cluster; 0 for root)
-      const parentCluster = 0;
+      // '..' (parent cluster; 0 for root in FAT12/16, 2 for root in FAT32)
+      const parentNode = allocation.parentMap.get(dirNode) || this.root;
+      const parentAlloc = allocation.directories.find((d) => d.node === parentNode);
+      const parentCluster =
+        parentNode === this.root
+          ? (geo.fatType === FatType.FAT32 ? 2 : 0)
+          : parentAlloc?.startCluster || 0;
       dirOffset += this.writeStandardDirEntry(
         dirBytes.subarray(dirOffset),
         '..         ',
@@ -355,37 +408,84 @@ export class FatBuilder {
     const bytesPerSector = FAT_SECTOR_SIZE;
     let totalSectors = this.options.totalSectors || 2880; // 1.44M floppy by default
     let fatType = this.options.fatType;
-    let sectorsPerCluster = this.options.sectorsPerCluster || 1;
+    const hasMbr = Boolean(this.options.hasMbr);
+
+    let hiddenSectors = this.options.hiddenSectors ?? 0;
+    let partitionSectors = totalSectors;
+
+    if (hasMbr) {
+      // MBR Partition 1 starts at Sector 2048 (1MB standard alignment)
+      hiddenSectors = this.options.hiddenSectors ?? 2048;
+      if (totalSectors <= hiddenSectors) {
+        totalSectors = hiddenSectors + 65536;
+      }
+      partitionSectors = totalSectors - hiddenSectors;
+    }
+
+    let sectorsPerCluster = 1;
     let reservedSectors = fatType === FatType.FAT32 ? 32 : 1;
     const fatCount = 2;
     let rootEntryCount = fatType === FatType.FAT32 ? 0 : fatType === FatType.FAT16 ? 512 : 224;
+    const rootDirSectors = Math.ceil((rootEntryCount * 32) / bytesPerSector);
     let mediaType = totalSectors === 2880 ? 0xf0 : 0xf8;
     let sectorsPerTrack = totalSectors === 2880 ? 18 : 63;
     let headCount = totalSectors === 2880 ? 2 : 255;
 
-    // Calculate sectors per FAT
-    const rootDirSectors = Math.ceil((rootEntryCount * 32) / bytesPerSector);
-    let sectorsPerFat = 9; // standard for 1.44M FAT12
-
-    if (fatType === FatType.FAT16) {
-      sectorsPerCluster = this.options.sectorsPerCluster || 4;
-      const approxDataSectors = totalSectors - reservedSectors - rootDirSectors;
-      const approxClusters = Math.floor(approxDataSectors / sectorsPerCluster);
-      sectorsPerFat = Math.ceil((approxClusters * 2) / bytesPerSector);
+    if (fatType === FatType.FAT12) {
+      sectorsPerCluster = this.options.sectorsPerCluster || 1;
+    } else if (fatType === FatType.FAT16) {
+      // For FAT16, totalClusters MUST strictly satisfy: 4085 <= totalClusters < 65525
+      if (partitionSectors > 4194304) {
+        partitionSectors = 4194304; // FAT16 hard maximum 2GB
+        totalSectors = hasMbr ? partitionSectors + hiddenSectors : partitionSectors;
+      }
+      let chosenSpc = 4;
+      for (const spc of [1, 2, 4, 8, 16, 32, 64]) {
+        const approxDataSecs = partitionSectors - reservedSectors - rootDirSectors;
+        const approxClusters = Math.floor(approxDataSecs / spc);
+        if (approxClusters < 65520) {
+          chosenSpc = spc;
+          break;
+        }
+      }
+      sectorsPerCluster = this.options.sectorsPerCluster || chosenSpc;
     } else if (fatType === FatType.FAT32) {
-      sectorsPerCluster = this.options.sectorsPerCluster || 8;
-      const approxDataSectors = totalSectors - reservedSectors;
-      const approxClusters = Math.floor(approxDataSectors / sectorsPerCluster);
-      sectorsPerFat = Math.ceil((approxClusters * 4) / bytesPerSector);
+      // For FAT32, totalClusters MUST satisfy: totalClusters >= 65525
+      // Absolute minimum partition size for FAT32 is ~67,000 sectors (~33.5MB)
+      if (partitionSectors < 67000) {
+        partitionSectors = 67000;
+        totalSectors = hasMbr ? partitionSectors + hiddenSectors : partitionSectors;
+      }
+      let chosenSpc = 1;
+      for (const spc of [64, 32, 16, 8, 4, 2, 1]) {
+        const approxDataSecs = partitionSectors - reservedSectors;
+        const approxClusters = Math.floor(approxDataSecs / spc);
+        if (approxClusters >= 65525) {
+          chosenSpc = spc;
+          break;
+        }
+      }
+      sectorsPerCluster = this.options.sectorsPerCluster || chosenSpc;
     }
 
+    const maxDataSecs = partitionSectors - reservedSectors - rootDirSectors;
+    const maxClusters = Math.floor(maxDataSecs / sectorsPerCluster);
+    const bytesPerFatEntry = fatType === FatType.FAT32 ? 4 : fatType === FatType.FAT16 ? 2 : 1.5;
+    const sectorsPerFat =
+      fatType === FatType.FAT12
+        ? 9
+        : Math.max(1, Math.ceil(((maxClusters + 2) * bytesPerFatEntry) / bytesPerSector));
+
     const firstDataSector = reservedSectors + fatCount * sectorsPerFat + rootDirSectors;
-    const dataSectors = totalSectors - firstDataSector;
+    const dataSectors = Math.max(0, partitionSectors - firstDataSector);
     const totalClusters = Math.floor(dataSectors / sectorsPerCluster);
 
     return {
       bytesPerSector,
       totalSectors,
+      partitionSectors,
+      hiddenSectors,
+      hasMbr,
       fatType,
       sectorsPerCluster,
       reservedSectors,
@@ -419,8 +519,10 @@ export class FatBuilder {
     disk[16] = geo.fatCount;
     this.writeUint16LE(disk, 17, geo.rootEntryCount);
 
-    if (geo.totalSectors < 65536) {
-      this.writeUint16LE(disk, 19, geo.totalSectors);
+    if (geo.fatType === FatType.FAT32) {
+      this.writeUint16LE(disk, 19, 0); // BPB_TotSec16 MUST be 0 on FAT32!
+    } else if (geo.partitionSectors < 65536) {
+      this.writeUint16LE(disk, 19, geo.partitionSectors);
     } else {
       this.writeUint16LE(disk, 19, 0);
     }
@@ -435,10 +537,12 @@ export class FatBuilder {
 
     this.writeUint16LE(disk, 24, geo.sectorsPerTrack);
     this.writeUint16LE(disk, 26, geo.headCount);
-    this.writeUint32LE(disk, 28, 0); // Hidden sectors
+    this.writeUint32LE(disk, 28, geo.hiddenSectors);
 
-    if (geo.totalSectors >= 65536) {
-      this.writeUint32LE(disk, 32, geo.totalSectors);
+    if (geo.fatType === FatType.FAT32) {
+      this.writeUint32LE(disk, 32, geo.partitionSectors);
+    } else if (geo.partitionSectors >= 65536) {
+      this.writeUint32LE(disk, 32, geo.partitionSectors);
     } else {
       this.writeUint32LE(disk, 32, 0);
     }
@@ -470,6 +574,26 @@ export class FatBuilder {
     disk[511] = 0xaa;
   }
 
+  private writeFsInfoSector(
+    disk: Uint8Array,
+    sectorIndex: number,
+    geo: ReturnType<typeof this.computeGeometry>,
+    freeClusters: number,
+    nextFreeCluster: number
+  ): void {
+    const offset = sectorIndex * geo.bytesPerSector;
+    // Lead signature: 0x41615252 (RRaA)
+    this.writeUint32LE(disk, offset, 0x41615252);
+    // Structure signature: 0x61417272 (rrAa) at offset 484
+    this.writeUint32LE(disk, offset + 484, 0x61417272);
+    // Free cluster count at offset 488
+    this.writeUint32LE(disk, offset + 488, freeClusters);
+    // Next free cluster at offset 492
+    this.writeUint32LE(disk, offset + 492, nextFreeCluster);
+    // Trail signature: 0xAA550000 (0x55, 0xAA) at offset 508
+    this.writeUint32LE(disk, offset + 508, 0xaa550000);
+  }
+
   private async allocateClusters(geo: ReturnType<typeof this.computeGeometry>) {
     const clusterSizeBytes = geo.sectorsPerCluster * geo.bytesPerSector;
     const fatTable: number[] = [
@@ -486,8 +610,12 @@ export class FatBuilder {
 
     const files: AllocatedItem[] = [];
     const directories: { node: VNode; startCluster: number }[] = [];
+    const parentMap = new Map<VNode, VNode>();
 
-    const allocateNode = (node: VNode) => {
+    const allocateNode = (node: VNode, parentNode?: VNode) => {
+      if (parentNode) {
+        parentMap.set(node, parentNode);
+      }
       const isRoot = node === this.root;
       if (node.isDirectory) {
         let dirCluster = 0;
@@ -505,10 +633,10 @@ export class FatBuilder {
         }
 
         for (const child of node.children || []) {
-          allocateNode(child);
+          allocateNode(child, node);
         }
       } else {
-        const size = node.data?.length ?? node.size ?? 0;
+        const size = node.fileRef?.size ?? node.data?.byteLength ?? node.size ?? 0;
         const count = size === 0 ? 0 : Math.max(1, Math.ceil(size / clusterSizeBytes));
         let startCluster = 0;
 
@@ -540,7 +668,14 @@ export class FatBuilder {
 
     allocateNode(this.root);
 
-    return { fatTable, files, directories };
+    return {
+      fatTable,
+      files,
+      directories,
+      parentMap,
+      allocatedClusterCount: nextFreeCluster - 2,
+      nextFreeCluster,
+    };
   }
 
 
