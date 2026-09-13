@@ -1,6 +1,6 @@
-# ISOWeb - Browser-Only VM Disk Image Studio (.ISO & .IMG)
+# Disk WebUI - Browser-Only VM Disk Image Studio (.VHDX, .VMDK, .ISO & .IMG)
 
-A 100% client-side, offline, high-performance VM disk image builder, viewer, and editor for `.ISO` (ISO 9660 + Joliet) and `.IMG` (FAT12, FAT16, FAT32) formats.
+A 100% client-side, offline, high-performance VM disk image builder, viewer, and editor for `.VHDX` (Hyper-V), `.VMDK` (VMware / VirtualBox), `.ISO` (ISO 9660 + Joliet), and `.IMG` / `.RAW` (FAT12, FAT16, FAT32, and exFAT) formats.
 
 ## Key Features
 

@@ -138,21 +138,25 @@ export class ExFatParser {
 
         if (fileName) {
           const nodePath = currentPath === '/' ? `/${fileName}` : `${currentPath}/${fileName}`;
+          const timeVal = this.readUint16LE(dirBytes, offset + 12);
+          const dateVal = this.readUint16LE(dirBytes, offset + 14);
+          const modifiedTime = dateVal !== 0 ? this.parseDosDateTime(timeVal, dateVal) : new Date();
+
           const childNode: VNode = {
             id: `exfat-${firstCluster}-${dataLength}-${fileName}`,
             name: fileName,
             path: nodePath,
             isDirectory: isDir,
             size: isDir ? 0 : dataLength,
-            modifiedTime: new Date(),
+            modifiedTime,
             startCluster: firstCluster,
-            sourceSector: Math.floor(this.clusterToByteOffset(firstCluster) / this.bytesPerSector),
+            sourceSector: firstCluster >= 2 ? Math.floor(this.clusterToByteOffset(firstCluster) / this.bytesPerSector) : 0,
             sourceLength: dataLength,
             children: isDir ? [] : undefined,
           };
           parentNode.children!.push(childNode);
 
-          if (isDir && firstCluster >= 4 && firstCluster !== cluster) {
+          if (isDir && firstCluster >= 2 && firstCluster !== cluster) {
             await this.parseDirectory(firstCluster, childNode, nodePath);
           }
         }
@@ -185,5 +189,15 @@ export class ExFatParser {
         (buf[offset + 3] << 24)) >>>
       0
     );
+  }
+
+  private parseDosDateTime(timeVal: number, dateVal: number): Date {
+    const sec = Math.min(59, (timeVal & 0x1f) * 2);
+    const min = Math.min(59, (timeVal >> 5) & 0x3f);
+    const hour = Math.min(23, (timeVal >> 11) & 0x1f);
+    const day = Math.max(1, Math.min(31, dateVal & 0x1f));
+    const month = Math.max(0, Math.min(11, ((dateVal >> 5) & 0x0f) - 1));
+    const year = 1980 + ((dateVal >> 9) & 0x7f);
+    return new Date(year, month, day, hour, min, sec);
   }
 }

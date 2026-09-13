@@ -34,12 +34,18 @@ export interface ExFatGeometry {
   bytesPerSectorShift: number; // 9 = 512 bytes
   bytesPerSector: number; // 512
   sectorsPerClusterShift: number; // e.g. 3 = 8 sectors (4KB clusters)
-  sectorsPerCluster: number; // 8
-  clusterSizeBytes: number; // 4096
+  sectorsPerCluster: number; // 8 or 64
+  clusterSizeBytes: number; // 4096 or 32768
   fatOffset: number; // sector offset where FAT starts
   fatLength: number; // sectors in FAT
   clusterHeapOffset: number; // sector offset where Cluster 2 starts (1MB aligned = 2048)
   clusterCount: number; // total clusters in heap
-  rootDirCluster: number; // typically 4
+  bitmapStartCluster: number;
+  bitmapClusterCount: number;
+  bitmapSizeBytes: number;
+  upcaseStartCluster: number;
+  upcaseClusterCount: number;
+  upcaseSizeBytes: number;
+  rootDirCluster: number; // typically 4 or dynamic
   volumeLabel: string;
 }

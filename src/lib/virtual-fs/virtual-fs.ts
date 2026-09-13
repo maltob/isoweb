@@ -9,8 +9,9 @@ import { ISO_SECTOR_SIZE } from '../iso/iso-types';
 import { RandomAccessReader } from '../reader';
 import { OpfsManager } from '../storage/opfs';
 import { BlobAccumulatorWriter, FileSystemAccessStreamWriter, ImageStreamWriter } from '../storage/stream-writer';
-import { DiskFormat, DiskImageInfo, VNode } from '../types';
+import { DiskFormat, DiskImageInfo, ImageExportOptions, VNode } from '../types';
 import { VmdkBuilder } from '../vmdk/vmdk-builder';
+import { VhdxBuilder } from '../vhdx/vhdx-builder';
 import { ZipArchiver } from './zip-export';
 
 export class VirtualFS {
@@ -113,12 +114,20 @@ export class VirtualFS {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
       formatName = `VMDK Virtual Disk - exFAT (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vhdx-fat32') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VHDX Virtual Disk - FAT32 (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vhdx-exfat') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VHDX Virtual Disk - exFAT (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
     }
 
     const isMbrFormat =
       hasMbr !== undefined
         ? hasMbr
-        : format === 'fat16' || format === 'fat32' || format.startsWith('vmdk');
+        : format === 'fat16' || format === 'fat32' || format.startsWith('vmdk') || format.startsWith('vhdx');
 
     const info: DiskImageInfo = {
       format,
@@ -317,25 +326,104 @@ export class VirtualFS {
    * Builds the disk image directly into a streaming writer (OPFS, Disk, or Memory)
    * Uses almost zero RAM even for multi-gigabyte disk images!
    */
+  /**
+   * Dynamically changes the active format of the virtual filesystem
+   */
+  setFormat(format: DiskFormat): void {
+    this.format = format;
+    this.imageInfo.format = format;
+    if (format === 'iso') {
+      this.imageInfo.formatName = 'ISO 9660 + Joliet';
+      this.imageInfo.sectorSize = 2048;
+      this.imageInfo.hasJoliet = true;
+      this.imageInfo.hasMbr = false;
+    } else if (format.startsWith('vmdk')) {
+      const isExfat = format === 'vmdk-exfat';
+      this.imageInfo.formatName = `VMDK Virtual Disk - ${isExfat ? 'exFAT' : 'FAT32'}`;
+      this.imageInfo.sectorSize = 512;
+      this.imageInfo.hasJoliet = false;
+      this.imageInfo.hasMbr = true;
+    } else if (format.startsWith('vhdx')) {
+      const isExfat = format === 'vhdx-exfat';
+      this.imageInfo.formatName = `VHDX Virtual Disk - ${isExfat ? 'exFAT' : 'FAT32'}`;
+      this.imageInfo.sectorSize = 512;
+      this.imageInfo.hasJoliet = false;
+      this.imageInfo.hasMbr = true;
+    } else if (format === 'exfat') {
+      this.imageInfo.formatName = 'exFAT Disk Image';
+      this.imageInfo.sectorSize = 512;
+      this.imageInfo.hasJoliet = false;
+      this.imageInfo.hasMbr = true;
+    } else {
+      this.imageInfo.formatName = `${format.toUpperCase()} Disk Image`;
+      this.imageInfo.sectorSize = 512;
+      this.imageInfo.hasJoliet = false;
+      this.imageInfo.hasMbr = format !== 'fat12';
+    }
+  }
+
+  /**
+   * Builds the disk image directly into a streaming writer (OPFS, Disk, or Memory)
+   * Uses almost zero RAM even for multi-gigabyte disk images!
+   */
   async buildToStream(
     writer: ImageStreamWriter,
-    onProgress?: (ratio: number, status: string) => void
+    onProgress?: (ratio: number, status: string) => void,
+    targetFormatOrOptions?: DiskFormat | ImageExportOptions
   ): Promise<void> {
-    if (this.format === 'vmdk-fat32' || this.format === 'vmdk-exfat') {
-      const builder = new VmdkBuilder(this.root, {
-        fsType: this.format === 'vmdk-fat32' ? 'fat32' : 'exfat',
-        volumeLabel: this.imageInfo.volumeLabel,
-        capacitySectors: this.imageInfo.totalSectors || 2097152,
+    const opts: ImageExportOptions =
+      typeof targetFormatOrOptions === 'string'
+        ? { format: targetFormatOrOptions }
+        : targetFormatOrOptions || {};
+    const fmt = opts.format || this.format;
+    const label = opts.volumeLabel || this.imageInfo.volumeLabel;
+    const userCapacitySectors = opts.capacityMb ? Math.floor((opts.capacityMb * 1024 * 1024) / 512) : undefined;
+
+    if (fmt === 'vhdx-fat32' || fmt === 'vhdx-exfat') {
+      const minCapacity = Math.max(
+        2097152, // 1 GB minimum default
+        Math.ceil((this.root.size * 1.5) / 512) + 4096
+      );
+      const capacitySectors = userCapacitySectors && userCapacitySectors >= minCapacity
+        ? userCapacitySectors
+        : this.imageInfo.totalSectors && this.imageInfo.totalSectors >= minCapacity
+        ? this.imageInfo.totalSectors
+        : minCapacity;
+
+      const builder = new VhdxBuilder(this.root, {
+        fsType: fmt === 'vhdx-fat32' ? 'fat32' : 'exfat',
+        volumeLabel: label || 'VHDX_DISK',
+        capacitySectors,
       });
       await builder.buildToStream(writer, onProgress);
-    } else if (this.format === 'exfat') {
-      const builder = new ExFatBuilder(this.root, this.imageInfo.volumeLabel, this.imageInfo.totalSectors);
+    } else if (fmt === 'vmdk-fat32' || fmt === 'vmdk-exfat') {
+      const minCapacity = Math.max(
+        2097152, // 1 GB minimum default
+        Math.ceil((this.root.size * 1.5) / 512) + 4096
+      );
+      const capacitySectors = userCapacitySectors && userCapacitySectors >= minCapacity
+        ? userCapacitySectors
+        : this.imageInfo.totalSectors && this.imageInfo.totalSectors >= minCapacity
+        ? this.imageInfo.totalSectors
+        : minCapacity;
+
+      const vmdkDiskName = `${(label || 'vmdk_disk').toLowerCase().replace(/[^a-z0-9_-]/g, '_')}.vmdk`;
+      const builder = new VmdkBuilder(this.root, {
+        fsType: fmt === 'vmdk-fat32' ? 'fat32' : 'exfat',
+        volumeLabel: label || 'VMDK_DISK',
+        capacitySectors,
+        diskName: vmdkDiskName,
+      });
       await builder.buildToStream(writer, onProgress);
-    } else if (this.format === 'iso') {
+    } else if (fmt === 'exfat') {
+      const sectors = userCapacitySectors || this.imageInfo.totalSectors || Math.max(2097152, Math.ceil((this.root.size * 1.5) / 512));
+      const builder = new ExFatBuilder(this.root, label || 'EXFAT', sectors);
+      await builder.buildToStream(writer, onProgress);
+    } else if (fmt === 'iso') {
       const builder = new IsoBuilder(
         this.root,
         {
-          volumeLabel: this.imageInfo.volumeLabel,
+          volumeLabel: label || 'CDROM',
           enableJoliet: this.imageInfo.hasJoliet !== false,
         },
         this.sourceReader
@@ -343,19 +431,40 @@ export class VirtualFS {
       await builder.buildToStream(writer, onProgress);
     } else {
       const fatType =
-        this.format === 'fat12'
+        fmt === 'fat12'
           ? FatType.FAT12
-          : this.format === 'fat16'
+          : fmt === 'fat16'
           ? FatType.FAT16
           : FatType.FAT32;
+
+      let sectors = userCapacitySectors || this.imageInfo.totalSectors;
+      const minRequiredSectors = Math.ceil((this.root.size * 1.3) / 512) + 2048;
+      const isCompatible =
+        sectors &&
+        sectors >= minRequiredSectors &&
+        (fatType === FatType.FAT12
+          ? sectors <= 5760
+          : fatType === FatType.FAT16
+          ? sectors >= 4096 && sectors <= 4194304
+          : sectors >= 67000);
+
+      if (!isCompatible) {
+        if (fatType === FatType.FAT12) {
+          sectors = 2880;
+        } else if (fatType === FatType.FAT16) {
+          sectors = Math.max(65536, Math.min(4194304, minRequiredSectors));
+        } else {
+          sectors = Math.max(131072, minRequiredSectors);
+        }
+      }
 
       const builder = new FatBuilder(
         this.root,
         {
           fatType,
-          volumeLabel: this.imageInfo.volumeLabel,
-          totalSectors: this.imageInfo.totalSectors,
-          hasMbr: this.imageInfo.hasMbr,
+          volumeLabel: label || 'DOS_DISK',
+          totalSectors: sectors,
+          hasMbr: this.imageInfo.hasMbr !== undefined ? this.imageInfo.hasMbr : fmt !== 'fat12',
         },
         this.sourceFatParser
       );
@@ -368,12 +477,13 @@ export class VirtualFS {
    */
   async buildToOpfs(
     fileName: string,
-    onProgress?: (ratio: number, status: string) => void
+    onProgress?: (ratio: number, status: string) => void,
+    targetFormatOrOptions?: DiskFormat | ImageExportOptions
   ): Promise<void> {
     const streamWriter = await OpfsManager.createStreamWriter(fileName);
     const accessWriter = new FileSystemAccessStreamWriter(streamWriter);
     try {
-      await this.buildToStream(accessWriter, onProgress);
+      await this.buildToStream(accessWriter, onProgress, targetFormatOrOptions);
     } finally {
       await accessWriter.close();
     }
@@ -384,12 +494,13 @@ export class VirtualFS {
    */
   async buildToDisk(
     fileHandle: FileSystemFileHandle,
-    onProgress?: (ratio: number, status: string) => void
+    onProgress?: (ratio: number, status: string) => void,
+    targetFormatOrOptions?: DiskFormat | ImageExportOptions
   ): Promise<void> {
     const writable = await fileHandle.createWritable();
     const accessWriter = new FileSystemAccessStreamWriter(writable);
     try {
-      await this.buildToStream(accessWriter, onProgress);
+      await this.buildToStream(accessWriter, onProgress, targetFormatOrOptions);
     } finally {
       await accessWriter.close();
     }
@@ -398,49 +509,25 @@ export class VirtualFS {
   /**
    * Builds and exports the disk image as a Blob
    */
-  async buildImageBlob(onProgress?: (ratio: number, status: string) => void): Promise<Blob> {
-    if (this.format === 'vmdk-fat32' || this.format === 'vmdk-exfat') {
-      const builder = new VmdkBuilder(this.root, {
-        fsType: this.format === 'vmdk-fat32' ? 'fat32' : 'exfat',
-        volumeLabel: this.imageInfo.volumeLabel,
-        capacitySectors: this.imageInfo.totalSectors || 2097152,
-      });
-      return await builder.buildBlob(onProgress);
-    } else if (this.format === 'exfat') {
-      const builder = new ExFatBuilder(this.root, this.imageInfo.volumeLabel, this.imageInfo.totalSectors);
-      const acc = new BlobAccumulatorWriter('application/octet-stream');
-      await builder.buildToStream(acc, onProgress);
-      return acc.getBlob();
-    } else if (this.format === 'iso') {
-      const builder = new IsoBuilder(
-        this.root,
-        {
-          volumeLabel: this.imageInfo.volumeLabel,
-          enableJoliet: this.imageInfo.hasJoliet !== false,
-        },
-        this.sourceReader
-      );
-      return await builder.buildBlob(onProgress);
-    } else {
-      const fatType =
-        this.format === 'fat12'
-          ? FatType.FAT12
-          : this.format === 'fat16'
-          ? FatType.FAT16
-          : FatType.FAT32;
-
-      const builder = new FatBuilder(
-        this.root,
-        {
-          fatType,
-          volumeLabel: this.imageInfo.volumeLabel,
-          totalSectors: this.imageInfo.totalSectors,
-          hasMbr: this.imageInfo.hasMbr,
-        },
-        this.sourceFatParser
-      );
-      return await builder.buildBlob(onProgress);
-    }
+  async buildImageBlob(
+    onProgress?: (ratio: number, status: string) => void,
+    targetFormatOrOptions?: DiskFormat | ImageExportOptions
+  ): Promise<Blob> {
+    const opts: ImageExportOptions =
+      typeof targetFormatOrOptions === 'string'
+        ? { format: targetFormatOrOptions }
+        : targetFormatOrOptions || {};
+    const fmt = opts.format || this.format;
+    const mimeType = fmt.startsWith('vhdx')
+      ? 'application/x-vhdx'
+      : fmt.startsWith('vmdk')
+      ? 'application/x-vmdk'
+      : fmt === 'iso'
+      ? 'application/x-iso9660-image'
+      : 'application/octet-stream';
+    const accumulator = new BlobAccumulatorWriter(mimeType);
+    await this.buildToStream(accumulator, onProgress, targetFormatOrOptions);
+    return accumulator.getBlob();
   }
 
   /**

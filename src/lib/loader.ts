@@ -8,16 +8,23 @@ import { DiskFormat } from './types';
 import { VirtualFS } from './virtual-fs/virtual-fs';
 import { VmdkParser } from './vmdk/vmdk-parser';
 import { VMDK_MAGIC } from './vmdk/vmdk-types';
+import { VhdxParser } from './vhdx/vhdx-parser';
 
 export class DiskImageLoader {
   /**
-   * Automatically detects and loads an ISO, IMG, or VMDK file
+   * Automatically detects and loads an ISO, IMG, VMDK, or VHDX file
    */
   static async load(
     reader: RandomAccessReader,
     fileNameHint: string = ''
   ): Promise<VirtualFS> {
     const format = await this.detectFormat(reader, fileNameHint);
+
+    if (format === 'vhdx-fat32' || format === 'vhdx-exfat') {
+      const parser = new VhdxParser(reader);
+      const { vfs } = await parser.parse();
+      return vfs;
+    }
 
     if (format === 'vmdk-fat32' || format === 'vmdk-exfat') {
       const parser = new VmdkParser(reader);
@@ -59,7 +66,12 @@ export class DiskImageLoader {
   ): Promise<DiskFormat> {
     const lowerName = fileNameHint.toLowerCase();
 
-    // 1. Check for VMDK magic 'KDMV' (0x564d444b)
+    // 1. Check for VHDX signature 'vhdxfile'
+    if (await VhdxParser.isVhdx(reader) || lowerName.endsWith('.vhdx')) {
+      return 'vhdx-fat32';
+    }
+
+    // 2. Check for VMDK magic 'KDMV' (0x564d444b)
     if (reader.size >= 512) {
       const headerBytes = await reader.read(0, 512);
       const magic =
@@ -73,7 +85,7 @@ export class DiskImageLoader {
         return 'vmdk-fat32';
       }
 
-      // 2. Check for exFAT ("EXFAT   " at offset 3)
+      // 3. Check for exFAT ("EXFAT   " at offset 3)
       const oemName = String.fromCharCode(...headerBytes.subarray(3, 11));
       if (oemName === 'EXFAT   ') {
         return 'exfat';

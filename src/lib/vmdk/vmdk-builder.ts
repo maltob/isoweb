@@ -29,9 +29,10 @@ export class VmdkBuilder {
 
   constructor(root: VNode, options: VmdkBuilderOptions) {
     this.root = root;
+    const vol = (options.volumeLabel || 'vmdk_disk').toLowerCase().replace(/[^a-z0-9_-]/g, '_');
     this.options = {
       capacitySectors: 2097152, // 1GB default
-      diskName: 'disk.vmdk',
+      diskName: `${vol}.vmdk`,
       volumeLabel: 'VMDK_DISK',
       ...options,
     };
@@ -79,12 +80,15 @@ export class VmdkBuilder {
         fatType: FatType.FAT32,
         volumeLabel: this.options.volumeLabel,
         totalSectors: partitionSectors,
+        hasMbr: false, // inner partition
+        hiddenSectors: partitionStartSector,
+        padToCapacity: false,
       });
       partitionBlob = await fatBuilder.buildBlob((r, s) => {
         onProgress?.(0.05 + r * 0.45, `Building FAT32: ${s}`);
       });
     } else {
-      const exfatBuilder = new ExFatBuilder(this.root, this.options.volumeLabel, partitionSectors, false);
+      const exfatBuilder = new ExFatBuilder(this.root, this.options.volumeLabel, partitionSectors, false, partitionStartSector);
       const acc = new BlobAccumulatorWriter('application/octet-stream');
       await exfatBuilder.buildToStream(acc, (r, s) => {
         onProgress?.(0.05 + r * 0.45, `Building exFAT: ${s}`);
@@ -98,9 +102,11 @@ export class VmdkBuilder {
     const mbrSector = new Uint8Array(VMDK_SECTOR_SIZE);
     // Partition 1 Entry (offset 446)
     mbrSector[446] = 0x80; // Active/Bootable
-    mbrSector[447] = 0x00; // Start Head
-    mbrSector[448] = 0x02; // Start Sector/Cylinder
-    mbrSector[449] = 0x00;
+    // CHS start for LBA 2048 with 255 heads, 63 sectors/track:
+    // Cyl 0, Head 32 (0x20), Sector 33 (0x21)
+    mbrSector[447] = 0x20; // Start Head (32)
+    mbrSector[448] = 0x21; // Start Sector (33)
+    mbrSector[449] = 0x00; // Start Cyl (0)
     mbrSector[450] = this.options.fsType === 'fat32' ? 0x0c : 0x07; // 0x0C = FAT32 LBA, 0x07 = exFAT
     mbrSector[451] = 0xfe; // End Head
     mbrSector[452] = 0xff; // End Sector/Cylinder
@@ -176,7 +182,10 @@ export class VmdkBuilder {
     headerBytes[76] = 0x0a; // doubleEndLineChar2 ('\n')
 
     // 5. Build Text Descriptor (Sectors 1..20)
-    const cylinders = Math.max(1, Math.floor(capacitySectors / (16 * 63)));
+    // VMware SCSI (lsilogic) geometry MUST specify 255 heads and 63 sectors/track
+    const heads = 255;
+    const sectors = 63;
+    const cylinders = Math.max(1, Math.floor(capacitySectors / (heads * sectors)));
     const descriptorText = [
       '# Disk DescriptorFile',
       'version=1',
@@ -191,11 +200,11 @@ export class VmdkBuilder {
       '#DDB',
       'ddb.adapterType = "lsilogic"',
       `ddb.geometry.cylinders = "${cylinders}"`,
-      'ddb.geometry.heads = "16"',
+      'ddb.geometry.heads = "255"',
       'ddb.geometry.sectors = "63"',
-      'ddb.virtualHWVersion = "4"',
+      'ddb.virtualHWVersion = "7"',
       '',
-    ].join('\n');
+    ].join('\r\n');
 
     const descriptorBytes = new Uint8Array(descriptorSize * VMDK_SECTOR_SIZE);
     for (let i = 0; i < descriptorText.length; i++) {

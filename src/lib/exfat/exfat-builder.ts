@@ -10,6 +10,54 @@ import {
   ExFatGeometry,
 } from './exfat-types';
 
+const ZERO_BUFFER_SIZE = 2 * 1024 * 1024; // 2 MB buffer for fast bulk streaming
+const ZERO_BUFFER = new Uint8Array(ZERO_BUFFER_SIZE);
+
+// Build compressed Unicode BMP Upcase Table per Microsoft exFAT specification (run-length encoded with 0xFFFF)
+function buildUpcaseTable(): { bytes: Uint8Array; checksum: number } {
+  const words: number[] = [];
+  let i = 0;
+  while (i < 65536) {
+    const ch = String.fromCharCode(i);
+    const upStr = ch.toUpperCase();
+    const up = upStr.length === 1 ? upStr.charCodeAt(0) : i;
+    if (up === i) {
+      let j = i + 1;
+      while (j < 65536) {
+        const chJ = String.fromCharCode(j);
+        const upStrJ = chJ.toUpperCase();
+        const upJ = upStrJ.length === 1 ? upStrJ.charCodeAt(0) : j;
+        if (upJ !== j) break;
+        j++;
+      }
+      const run = j - i;
+      if (run >= 3) {
+        words.push(0xffff);
+        words.push(run);
+        i = j;
+        continue;
+      }
+    }
+    words.push(up);
+    i++;
+  }
+
+  const bytes = new Uint8Array(words.length * 2);
+  for (let k = 0; k < words.length; k++) {
+    bytes[k * 2] = words[k] & 0xff;
+    bytes[k * 2 + 1] = (words[k] >> 8) & 0xff;
+  }
+
+  let checksum = 0;
+  for (let k = 0; k < bytes.length; k++) {
+    checksum = (((checksum << 31) | (checksum >>> 1)) + bytes[k]) >>> 0;
+  }
+
+  return { bytes, checksum };
+}
+
+const { bytes: UPCASE_TABLE_BYTES, checksum: UPCASE_TABLE_CHECKSUM } = buildUpcaseTable();
+
 interface AllocatedClusterItem {
   node: VNode;
   startCluster: number;
@@ -23,25 +71,28 @@ export class ExFatBuilder {
   private volumeLabel: string;
   private totalSectors: number;
   private padToCapacity: boolean;
+  private partitionOffset: number;
 
   constructor(
     root: VNode,
     volumeLabel: string = 'EXFAT_DISK',
     totalSectors: number = 2097152,
-    padToCapacity: boolean = true
+    padToCapacity: boolean = true,
+    partitionOffset: number = 0
   ) {
     this.root = root;
     this.volumeLabel = volumeLabel.slice(0, 11);
     this.totalSectors = Math.max(65536, totalSectors); // Minimum 32MB for exFAT
     this.padToCapacity = padToCapacity;
+    this.partitionOffset = partitionOffset;
   }
 
   computeGeometry(): ExFatGeometry {
     const bytesPerSector = EXFAT_SECTOR_SIZE;
     const bytesPerSectorShift = 9;
 
-    // Cluster size: 4KB (8 sectors) for <= 8GB, 32KB (64 sectors) for larger
-    const sectorsPerCluster = this.totalSectors > 16777216 ? 64 : 8;
+    // Cluster size: 4KB (8 sectors) for <= 256MB, 32KB (64 sectors) for larger
+    const sectorsPerCluster = this.totalSectors > 524288 ? 64 : 8;
     const sectorsPerClusterShift = Math.round(Math.log2(sectorsPerCluster));
     const clusterSizeBytes = sectorsPerCluster * bytesPerSector;
 
@@ -58,6 +109,16 @@ export class ExFatBuilder {
     const clusterCount = Math.floor(dataSectors / sectorsPerCluster);
     const fatLength = Math.max(1, Math.ceil(((clusterCount + 2) * 4) / bytesPerSector));
 
+    const bitmapSizeBytes = Math.ceil(clusterCount / 8);
+    const bitmapClusterCount = Math.max(1, Math.ceil(bitmapSizeBytes / clusterSizeBytes));
+    const bitmapStartCluster = 2;
+
+    const upcaseSizeBytes = UPCASE_TABLE_BYTES.byteLength;
+    const upcaseClusterCount = Math.max(1, Math.ceil(upcaseSizeBytes / clusterSizeBytes));
+    const upcaseStartCluster = bitmapStartCluster + bitmapClusterCount;
+
+    const rootDirCluster = upcaseStartCluster + upcaseClusterCount;
+
     return {
       totalSectors: this.totalSectors,
       bytesPerSectorShift,
@@ -69,7 +130,13 @@ export class ExFatBuilder {
       fatLength,
       clusterHeapOffset,
       clusterCount,
-      rootDirCluster: 4, // Cluster 2=Bitmap, Cluster 3=Upcase, Cluster 4=Root
+      bitmapStartCluster,
+      bitmapClusterCount,
+      bitmapSizeBytes,
+      upcaseStartCluster,
+      upcaseClusterCount,
+      upcaseSizeBytes,
+      rootDirCluster,
       volumeLabel: this.volumeLabel,
     };
   }
@@ -108,17 +175,17 @@ export class ExFatBuilder {
       await writer.write(new Uint8Array(padToHeap));
     }
 
-    // 4. Cluster 2: Allocation Bitmap
+    // 4. Cluster bitmapStartCluster..: Allocation Bitmap
     onProgress?.(0.45, 'Writing Allocation Bitmap...');
     const bitmapBytes = this.generateAllocationBitmap(geo, allocation);
     await writer.write(bitmapBytes);
 
-    // 5. Cluster 3: Upcase Table
+    // 5. Cluster upcaseStartCluster..: Upcase Table
     onProgress?.(0.5, 'Writing Upcase Table...');
     const upcaseBytes = this.generateUpcaseTable(geo);
     await writer.write(upcaseBytes);
 
-    // 6. Cluster 4+: Root directory, subdirectories, and files
+    // 6. Cluster rootDirCluster+: Root directory, subdirectories, and files
     onProgress?.(0.6, 'Streaming exFAT directories and files...');
     await this.streamClusterHeap(writer, geo, allocation, onProgress);
 
@@ -127,46 +194,66 @@ export class ExFatBuilder {
 
   private allocateClusters(geo: ExFatGeometry) {
     const items: AllocatedClusterItem[] = [];
-    // Clusters 0 & 1 are reserved
-    // Cluster 2: Bitmap (1 cluster)
-    // Cluster 3: Upcase (1 cluster)
-    // Cluster 4: Root directory
-    let nextCluster = 4;
+    const calcDirClusterCount = (dir: VNode, isRoot: boolean): number => {
+      let entries = isRoot ? (this.volumeLabel ? 1 : 0) + 2 : 0; // volume label + bitmap + upcase
+      for (const child of dir.children || []) {
+        const nameChars = child.name.length;
+        const nameEntries = Math.ceil(nameChars / 15);
+        entries += 2 + nameEntries; // 1 file + 1 stream ext + N name entries
+      }
+      return Math.max(1, Math.ceil((entries * 32) / geo.clusterSizeBytes));
+    };
 
+    const rootClusterCount = calcDirClusterCount(this.root, true);
     const rootItem: AllocatedClusterItem = {
       node: this.root,
-      startCluster: nextCluster++,
-      clusterCount: 1,
-      size: geo.clusterSizeBytes,
+      startCluster: geo.rootDirCluster,
+      clusterCount: rootClusterCount,
+      size: rootClusterCount * geo.clusterSizeBytes,
       isDir: true,
     };
     items.push(rootItem);
+    let nextCluster = geo.rootDirCluster + rootClusterCount;
 
     // Traverse directories and files
     const traverse = (dir: VNode) => {
       for (const child of dir.children || []) {
         if (child.isDirectory) {
-          const item: AllocatedClusterItem = {
-            node: child,
-            startCluster: nextCluster++,
-            clusterCount: 1,
-            size: geo.clusterSizeBytes,
-            isDir: true,
-          };
-          items.push(item);
-          traverse(child);
-        } else {
-          const size = child.fileRef?.size ?? child.data?.byteLength ?? child.sourceLength ?? child.size ?? 0;
-          const clusterCount = Math.max(1, Math.ceil(size / geo.clusterSizeBytes));
+          const dirClusters = calcDirClusterCount(child, false);
           const item: AllocatedClusterItem = {
             node: child,
             startCluster: nextCluster,
-            clusterCount,
-            size,
-            isDir: false,
+            clusterCount: dirClusters,
+            size: dirClusters * geo.clusterSizeBytes,
+            isDir: true,
           };
           items.push(item);
-          nextCluster += clusterCount;
+          nextCluster += dirClusters;
+          traverse(child);
+        } else {
+          const size = child.fileRef?.size ?? child.data?.byteLength ?? child.sourceLength ?? child.size ?? 0;
+          if (size === 0) {
+            // Per exFAT spec: zero-byte files have no clusters allocated
+            const item: AllocatedClusterItem = {
+              node: child,
+              startCluster: 0,
+              clusterCount: 0,
+              size: 0,
+              isDir: false,
+            };
+            items.push(item);
+          } else {
+            const clusterCount = Math.max(1, Math.ceil(size / geo.clusterSizeBytes));
+            const item: AllocatedClusterItem = {
+              node: child,
+              startCluster: nextCluster,
+              clusterCount,
+              size,
+              isDir: false,
+            };
+            items.push(item);
+            nextCluster += clusterCount;
+          }
         }
       }
     };
@@ -185,8 +272,8 @@ export class ExFatBuilder {
     bpb[2] = 0x90; // JMP SHORT 0x76, NOP
     for (let i = 0; i < 8; i++) bpb[3 + i] = EXFAT_OEM_NAME.charCodeAt(i);
 
-    // PartitionOffset: 0 (or MBR offset if partitioned)
-    this.writeUint64LE(bpb, 64, 0);
+    // PartitionOffset: sector offset from media origin (e.g. 2048 if partitioned)
+    this.writeUint64LE(bpb, 64, this.partitionOffset);
     // VolumeLength (total sectors)
     this.writeUint64LE(bpb, 72, geo.totalSectors);
     // FatOffset
@@ -269,13 +356,24 @@ export class ExFatBuilder {
     this.writeUint32LE(fat, 0, 0xfffffff8);
     // Entry 1: Reserved (0xFFFFFFFF)
     this.writeUint32LE(fat, 4, 0xffffffff);
-    // Cluster 2 (Bitmap): EOF
-    this.writeUint32LE(fat, 8, 0xffffffff);
-    // Cluster 3 (Upcase): EOF
-    this.writeUint32LE(fat, 12, 0xffffffff);
+
+    // Bitmap cluster chain:
+    for (let c = 0; c < geo.bitmapClusterCount; c++) {
+      const clusterNum = geo.bitmapStartCluster + c;
+      const next = c === geo.bitmapClusterCount - 1 ? 0xffffffff : clusterNum + 1;
+      this.writeUint32LE(fat, clusterNum * 4, next);
+    }
+
+    // Upcase table cluster chain:
+    for (let c = 0; c < geo.upcaseClusterCount; c++) {
+      const clusterNum = geo.upcaseStartCluster + c;
+      const next = c === geo.upcaseClusterCount - 1 ? 0xffffffff : clusterNum + 1;
+      this.writeUint32LE(fat, clusterNum * 4, next);
+    }
 
     // Allocate clusters for items
     for (const item of allocation.items) {
+      if (item.clusterCount === 0 || item.startCluster === 0) continue;
       for (let c = 0; c < item.clusterCount; c++) {
         const clusterNum = item.startCluster + c;
         const next = c === item.clusterCount - 1 ? 0xffffffff : clusterNum + 1;
@@ -290,15 +388,21 @@ export class ExFatBuilder {
     geo: ExFatGeometry,
     allocation: ReturnType<typeof this.allocateClusters>
   ): Uint8Array {
-    const bitmap = new Uint8Array(geo.clusterSizeBytes);
-    // Bits in bitmap correspond to clusters starting at Cluster 2:
-    // Bit 0 = Cluster 2 (Bitmap) -> 1
-    // Bit 1 = Cluster 3 (Upcase) -> 1
-    // Bit 2 = Cluster 4 (Root)   -> 1
-    this.setBitmapBit(bitmap, 0); // Cluster 2
-    this.setBitmapBit(bitmap, 1); // Cluster 3
+    const bitmap = new Uint8Array(geo.bitmapClusterCount * geo.clusterSizeBytes);
 
+    // Bitmap clusters
+    for (let c = 0; c < geo.bitmapClusterCount; c++) {
+      this.setBitmapBit(bitmap, geo.bitmapStartCluster + c - 2);
+    }
+
+    // Upcase Table clusters
+    for (let c = 0; c < geo.upcaseClusterCount; c++) {
+      this.setBitmapBit(bitmap, geo.upcaseStartCluster + c - 2);
+    }
+
+    // Allocated items
     for (const item of allocation.items) {
+      if (item.clusterCount === 0 || item.startCluster === 0) continue;
       for (let c = 0; c < item.clusterCount; c++) {
         const clusterIndex = item.startCluster + c - 2;
         this.setBitmapBit(bitmap, clusterIndex);
@@ -317,14 +421,8 @@ export class ExFatBuilder {
   }
 
   private generateUpcaseTable(geo: ExFatGeometry): Uint8Array {
-    const table = new Uint8Array(geo.clusterSizeBytes);
-    // Compressed upcase table: identity mapping except a-z (0x61-0x7A) -> A-Z (0x41-0x5A)
-    // In uncompressed/simple form: emit 128 characters (0..127) as 16-bit LE
-    for (let ch = 0; ch < 128; ch++) {
-      const up = ch >= 0x61 && ch <= 0x7a ? ch - 0x20 : ch;
-      table[ch * 2] = up & 0xff;
-      table[ch * 2 + 1] = 0x00;
-    }
+    const table = new Uint8Array(geo.upcaseClusterCount * geo.clusterSizeBytes);
+    table.set(UPCASE_TABLE_BYTES, 0);
     return table;
   }
 
@@ -334,10 +432,12 @@ export class ExFatBuilder {
     allocation: ReturnType<typeof this.allocateClusters>,
     onProgress?: (ratio: number, status: string) => void
   ): Promise<void> {
-    let currentCluster = 4;
+    let currentCluster = geo.rootDirCluster;
 
     for (let i = 0; i < allocation.items.length; i++) {
       const item = allocation.items[i];
+      if (item.clusterCount === 0) continue;
+
       const progress = 0.6 + (i / allocation.items.length) * 0.38;
       onProgress?.(progress, `Writing ${item.isDir ? 'directory' : 'file'}: ${item.node.name}`);
 
@@ -359,13 +459,31 @@ export class ExFatBuilder {
     if (this.padToCapacity) {
       const totalDataBytes = geo.clusterCount * geo.clusterSizeBytes;
       const bytesWrittenInData = (currentCluster - 2) * geo.clusterSizeBytes;
-      let remainingBytes = Math.max(0, totalDataBytes - bytesWrittenInData);
+      const leftoverBytes = Math.max(
+        0,
+        (this.totalSectors - (geo.clusterHeapOffset + geo.clusterCount * geo.sectorsPerCluster)) *
+          geo.bytesPerSector
+      );
+      let remainingBytes = Math.max(0, totalDataBytes - bytesWrittenInData) + leftoverBytes;
       if (remainingBytes > 0) {
-        const zeroChunk = new Uint8Array(Math.min(65536, geo.clusterSizeBytes));
+        const totalPadBytes = remainingBytes;
+        let padWritten = 0;
+        let lastReportTime = 0;
         while (remainingBytes > 0) {
-          const toWrite = Math.min(zeroChunk.byteLength, remainingBytes);
-          await writer.write(toWrite === zeroChunk.byteLength ? zeroChunk : zeroChunk.subarray(0, toWrite));
+          const toWrite = Math.min(ZERO_BUFFER.byteLength, remainingBytes);
+          await writer.write(toWrite === ZERO_BUFFER.byteLength ? ZERO_BUFFER : ZERO_BUFFER.subarray(0, toWrite));
           remainingBytes -= toWrite;
+          padWritten += toWrite;
+
+          const now = performance.now();
+          if (now - lastReportTime >= 100 || remainingBytes === 0) {
+            lastReportTime = now;
+            const padRatio = padWritten / totalPadBytes;
+            const ratio = 0.6 + padRatio * 0.39;
+            const writtenMb = Math.round(padWritten / (1024 * 1024));
+            const totalMb = Math.round(totalPadBytes / (1024 * 1024));
+            onProgress?.(ratio, `Writing disk image: ${writtenMb} MB / ${totalMb} MB...`);
+          }
         }
       }
     }
@@ -376,7 +494,9 @@ export class ExFatBuilder {
     geo: ExFatGeometry,
     allocation: ReturnType<typeof this.allocateClusters>
   ): Uint8Array {
-    const dirBytes = new Uint8Array(geo.clusterSizeBytes);
+    const item = allocation.items.find((it) => it.node === dirNode);
+    const clusterCount = item?.clusterCount || 1;
+    const dirBytes = new Uint8Array(clusterCount * geo.clusterSizeBytes);
     let offset = 0;
 
     if (dirNode === this.root) {
@@ -393,16 +513,16 @@ export class ExFatBuilder {
       // 2. Allocation Bitmap Entry (0x81)
       dirBytes[offset] = ExFatEntryType.AllocationBitmap;
       dirBytes[offset + 1] = 0; // BitmapFlags: 0 = First FAT
-      this.writeUint32LE(dirBytes, offset + 20, 2); // FirstCluster = 2
-      this.writeUint64LE(dirBytes, offset + 24, Math.ceil(geo.clusterCount / 8)); // DataLength
+      this.writeUint32LE(dirBytes, offset + 20, geo.bitmapStartCluster); // FirstCluster
+      this.writeUint64LE(dirBytes, offset + 24, geo.bitmapSizeBytes); // DataLength
       offset += 32;
 
       // 3. Upcase Table Entry (0x82)
       dirBytes[offset] = ExFatEntryType.UpcaseTable;
       dirBytes[offset + 1] = 0;
-      this.writeUint32LE(dirBytes, offset + 4, 0xe618); // TableChecksum
-      this.writeUint32LE(dirBytes, offset + 20, 3); // FirstCluster = 3
-      this.writeUint64LE(dirBytes, offset + 24, 256); // DataLength
+      this.writeUint32LE(dirBytes, offset + 4, UPCASE_TABLE_CHECKSUM); // TableChecksum
+      this.writeUint32LE(dirBytes, offset + 20, geo.upcaseStartCluster); // FirstCluster
+      this.writeUint64LE(dirBytes, offset + 24, geo.upcaseSizeBytes); // DataLength
       offset += 32;
     }
 
@@ -422,17 +542,33 @@ export class ExFatBuilder {
       dirBytes[fileEntryOffset + 1] = secondaryCount;
       const attr = child.isDirectory ? ExFatFileAttributes.Directory : ExFatFileAttributes.Archive;
       this.writeUint16LE(dirBytes, fileEntryOffset + 4, attr);
+
+      // File Timestamps (Create, Last Modified, Last Access)
+      const mtime = child.modifiedTime || new Date();
+      this.writeDosDateTime(dirBytes, fileEntryOffset + 8, mtime);
+      this.writeDosDateTime(dirBytes, fileEntryOffset + 12, mtime);
+      this.writeDosDateTime(dirBytes, fileEntryOffset + 16, mtime);
       offset += 32;
 
       // 2. Stream Extension Entry (0xC0)
       const streamOffset = offset;
       dirBytes[streamOffset] = ExFatEntryType.StreamExtension;
-      dirBytes[streamOffset + 1] = 0x01 | 0x02; // AllocationPossible | NoFatChain (contiguous)
-      dirBytes[streamOffset + 3] = nameChars;
-      this.writeUint16LE(dirBytes, streamOffset + 4, this.computeNameHash(name));
-      this.writeUint64LE(dirBytes, streamOffset + 8, item.size); // ValidDataLength
-      this.writeUint32LE(dirBytes, streamOffset + 20, item.startCluster);
-      this.writeUint64LE(dirBytes, streamOffset + 24, item.size); // DataLength
+      if (item.size === 0 && !child.isDirectory) {
+        // Zero-byte file per exFAT spec: AllocationPossible = 0, NoFatChain = 0, FirstCluster = 0
+        dirBytes[streamOffset + 1] = 0x00;
+        dirBytes[streamOffset + 3] = nameChars;
+        this.writeUint16LE(dirBytes, streamOffset + 4, this.computeNameHash(name));
+        this.writeUint64LE(dirBytes, streamOffset + 8, 0);
+        this.writeUint32LE(dirBytes, streamOffset + 20, 0);
+        this.writeUint64LE(dirBytes, streamOffset + 24, 0);
+      } else {
+        dirBytes[streamOffset + 1] = 0x01 | 0x02; // AllocationPossible | NoFatChain (contiguous)
+        dirBytes[streamOffset + 3] = nameChars;
+        this.writeUint16LE(dirBytes, streamOffset + 4, this.computeNameHash(name));
+        this.writeUint64LE(dirBytes, streamOffset + 8, item.size); // ValidDataLength
+        this.writeUint32LE(dirBytes, streamOffset + 20, item.startCluster);
+        this.writeUint64LE(dirBytes, streamOffset + 24, item.size); // DataLength
+      }
       offset += 32;
 
       // 3. File Name Entries (0xC1)
@@ -460,13 +596,13 @@ export class ExFatBuilder {
   private computeNameHash(name: string): number {
     let hash = 0;
     for (let i = 0; i < name.length; i++) {
-      let code = name.charCodeAt(i);
-      // Uppercase ASCII
-      if (code >= 0x61 && code <= 0x7a) code -= 0x20;
+      const ch = name[i];
+      const upStr = ch.toUpperCase();
+      const code = upStr.length === 1 ? upStr.charCodeAt(0) : name.charCodeAt(i);
       const b0 = code & 0xff;
       const b1 = (code >> 8) & 0xff;
-      hash = (((hash << 15) | (hash >>> 1)) + b0) & 0xffff;
-      hash = (((hash << 15) | (hash >>> 1)) + b1) & 0xffff;
+      hash = (((hash & 1 ? 0x8000 : 0) + (hash >>> 1) + b0) & 0xffff);
+      hash = (((hash & 1 ? 0x8000 : 0) + (hash >>> 1) + b1) & 0xffff);
     }
     return hash;
   }
@@ -476,9 +612,23 @@ export class ExFatBuilder {
     for (let i = 0; i < entries.length; i++) {
       // Skip SetChecksum field (bytes 2 and 3 of File Directory Entry)
       if (i === 2 || i === 3) continue;
-      checksum = (((checksum << 15) | (checksum >>> 1)) + entries[i]) & 0xffff;
+      checksum = (((checksum & 1 ? 0x8000 : 0) + (checksum >>> 1) + entries[i]) & 0xffff);
     }
     return checksum;
+  }
+
+  private writeDosDateTime(buf: Uint8Array, offset: number, date: Date): void {
+    const time =
+      ((date.getHours() & 0x1f) << 11) |
+      ((date.getMinutes() & 0x3f) << 5) |
+      (Math.floor(date.getSeconds() / 2) & 0x1f);
+    const d =
+      (((Math.max(1980, date.getFullYear()) - 1980) & 0x7f) << 9) |
+      (((date.getMonth() + 1) & 0x0f) << 5) |
+      (date.getDate() & 0x1f);
+
+    this.writeUint16LE(buf, offset, time);
+    this.writeUint16LE(buf, offset + 2, d);
   }
 
   private async streamFileData(node: VNode, writer: ImageStreamWriter): Promise<void> {
@@ -515,7 +665,9 @@ export class ExFatBuilder {
   }
 
   private writeUint64LE(buf: Uint8Array, offset: number, val: number) {
-    this.writeUint32LE(buf, offset, val & 0xffffffff);
-    this.writeUint32LE(buf, offset + 4, Math.floor(val / 0x100000000));
+    const low = val >>> 0;
+    const high = Math.floor(val / 0x100000000);
+    this.writeUint32LE(buf, offset, low);
+    this.writeUint32LE(buf, offset + 4, high);
   }
 }

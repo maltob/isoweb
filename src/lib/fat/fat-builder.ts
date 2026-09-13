@@ -8,6 +8,9 @@ import {
   FatType,
 } from './fat-types';
 
+const ZERO_BUFFER_SIZE = 2 * 1024 * 1024; // 2 MB buffer for fast bulk streaming
+const ZERO_BUFFER = new Uint8Array(ZERO_BUFFER_SIZE);
+
 export interface FatBuilderOptions {
   fatType: FatType;
   volumeLabel?: string;
@@ -15,6 +18,7 @@ export interface FatBuilderOptions {
   sectorsPerCluster?: number;
   hasMbr?: boolean;
   hiddenSectors?: number;
+  padToCapacity?: boolean;
 }
 
 interface AllocatedItem {
@@ -43,29 +47,27 @@ export class FatBuilder {
   }
 
   /**
-   * Builds the FAT disk image directly into a streaming writer (OPFS, Disk, or Memory)
-   * Streams sequentially so multi-gigabyte disk images use almost zero RAM!
+   * Builds the FAT image and writes it directly to an ImageStreamWriter (Direct-to-Disk or OPFS)
    */
   async buildToStream(
     writer: ImageStreamWriter,
     onProgress?: (ratio: number, status: string) => void
   ): Promise<void> {
-    onProgress?.(0.05, 'Configuring FAT filesystem geometry...');
+    onProgress?.(0.05, 'Calculating disk geometry...');
     const geo = this.computeGeometry();
 
-    // 1. Allocate clusters for all files and directories first
-    onProgress?.(0.1, 'Allocating cluster map...');
+    // 1. Allocate clusters for all files and directories
+    onProgress?.(0.1, 'Allocating clusters and directory entries...');
     const allocation = await this.allocateClusters(geo);
 
-    // 2. If MBR requested, write MBR Sector 0 and padding up to Partition 1
+    // 2. Write MBR if requested
     if (geo.hasMbr) {
-      onProgress?.(0.15, 'Writing MBR partition table...');
+      onProgress?.(0.15, 'Writing Master Boot Record (MBR)...');
       const mbrSector = new Uint8Array(geo.bytesPerSector);
-      // Partition 1 Entry at offset 446 (0x1BE)
-      mbrSector[446] = 0x80; // Active / bootable
+      mbrSector[446] = 0x80; // Active/bootable
       mbrSector[447] = 0x00; // Start Head
-      mbrSector[448] = 0x02; // Start Sector
-      mbrSector[449] = 0x00; // Start Cylinder
+      mbrSector[448] = 0x02; // Start Sector/Cylinder
+      mbrSector[449] = 0x00;
       mbrSector[450] =
         geo.fatType === FatType.FAT32
           ? 0x0c
@@ -82,15 +84,11 @@ export class FatBuilder {
       await writer.write(mbrSector);
 
       // Pad sectors 1 to (geo.hiddenSectors - 1)
-      const padBytes = (geo.hiddenSectors - 1) * geo.bytesPerSector;
-      if (padBytes > 0) {
-        const zeroChunk = new Uint8Array(Math.min(65536, padBytes));
-        let rem = padBytes;
-        while (rem > 0) {
-          const toWrite = Math.min(zeroChunk.byteLength, rem);
-          await writer.write(toWrite === zeroChunk.byteLength ? zeroChunk : zeroChunk.subarray(0, toWrite));
-          rem -= toWrite;
-        }
+      let rem = (geo.hiddenSectors - 1) * geo.bytesPerSector;
+      while (rem > 0) {
+        const toWrite = Math.min(ZERO_BUFFER.byteLength, rem);
+        await writer.write(toWrite === ZERO_BUFFER.byteLength ? ZERO_BUFFER : ZERO_BUFFER.subarray(0, toWrite));
+        rem -= toWrite;
       }
     }
 
@@ -179,6 +177,7 @@ export class FatBuilder {
     const rootBytes = new Uint8Array(geo.rootEntryCount * 32);
     let rootOffset = 0;
     rootOffset += this.writeVolumeLabelEntry(rootBytes.subarray(rootOffset), geo.volumeLabel);
+    const usedNames = new Set<string>();
 
     for (const child of this.root.children || []) {
       const alloc = child.isDirectory
@@ -193,7 +192,8 @@ export class FatBuilder {
         child.isDirectory,
         startClus,
         size,
-        child.modifiedTime
+        child.modifiedTime,
+        usedNames
       );
     }
 
@@ -219,9 +219,10 @@ export class FatBuilder {
 
     // FAT32 Root Directory is at cluster 2
     if (geo.fatType === FatType.FAT32) {
+      const rootAlloc = allocation.directories.find((d) => d.node === this.root);
       clusterItems.push({
         startCluster: 2,
-        clusterCount: 1,
+        clusterCount: rootAlloc ? rootAlloc.clusterCount : 1,
         node: this.root,
         isDir: true,
         size: 0,
@@ -233,7 +234,7 @@ export class FatBuilder {
       if (dir.node === this.root) continue;
       clusterItems.push({
         startCluster: dir.startCluster,
-        clusterCount: 1,
+        clusterCount: dir.clusterCount,
         node: dir.node,
         isDir: true,
         size: 0,
@@ -262,10 +263,13 @@ export class FatBuilder {
       const item = clusterItems[i];
 
       // Fill any gap between clusters with zeros
-      while (currentCluster < item.startCluster) {
-        await writer.write(new Uint8Array(clusterSizeBytes));
-        currentCluster++;
+      let gapBytes = (item.startCluster - currentCluster) * clusterSizeBytes;
+      while (gapBytes > 0) {
+        const toWrite = Math.min(ZERO_BUFFER.byteLength, gapBytes);
+        await writer.write(toWrite === ZERO_BUFFER.byteLength ? ZERO_BUFFER : ZERO_BUFFER.subarray(0, toWrite));
+        gapBytes -= toWrite;
       }
+      currentCluster = item.startCluster;
 
       const prog = 0.5 + (i / Math.max(1, totalItems)) * 0.45;
       onProgress?.(prog, `Writing cluster ${item.startCluster}: ${item.node.name}`);
@@ -280,16 +284,31 @@ export class FatBuilder {
       }
     }
 
-    // Fill remaining empty clusters and leftover sectors up to total dataSectors with zeros (in 64KB chunks)
-    const totalDataBytes = geo.dataSectors * geo.bytesPerSector;
-    const bytesWrittenInData = (currentCluster - 2) * clusterSizeBytes;
-    let remainingBytes = Math.max(0, totalDataBytes - bytesWrittenInData);
-    if (remainingBytes > 0) {
-      const zeroChunk = new Uint8Array(Math.min(65536, clusterSizeBytes));
-      while (remainingBytes > 0) {
-        const toWrite = Math.min(zeroChunk.byteLength, remainingBytes);
-        await writer.write(toWrite === zeroChunk.byteLength ? zeroChunk : zeroChunk.subarray(0, toWrite));
-        remainingBytes -= toWrite;
+    // Fill remaining empty clusters and leftover sectors up to total dataSectors with zeros
+    if (this.options.padToCapacity !== false) {
+      const totalDataBytes = geo.dataSectors * geo.bytesPerSector;
+      const bytesWrittenInData = (currentCluster - 2) * clusterSizeBytes;
+      let remainingBytes = Math.max(0, totalDataBytes - bytesWrittenInData);
+      if (remainingBytes > 0) {
+        const totalPadBytes = remainingBytes;
+        let padWritten = 0;
+        let lastReportTime = 0;
+        while (remainingBytes > 0) {
+          const toWrite = Math.min(ZERO_BUFFER.byteLength, remainingBytes);
+          await writer.write(toWrite === ZERO_BUFFER.byteLength ? ZERO_BUFFER : ZERO_BUFFER.subarray(0, toWrite));
+          remainingBytes -= toWrite;
+          padWritten += toWrite;
+
+          const now = performance.now();
+          if (now - lastReportTime >= 100 || remainingBytes === 0) {
+            lastReportTime = now;
+            const padRatio = padWritten / totalPadBytes;
+            const ratio = 0.5 + padRatio * 0.49;
+            const writtenMb = Math.round(padWritten / (1024 * 1024));
+            const totalMb = Math.round(totalPadBytes / (1024 * 1024));
+            onProgress?.(ratio, `Writing disk image: ${writtenMb} MB / ${totalMb} MB...`);
+          }
+        }
       }
     }
   }
@@ -299,15 +318,17 @@ export class FatBuilder {
     geo: ReturnType<typeof this.computeGeometry>,
     allocation: Awaited<ReturnType<typeof this.allocateClusters>>
   ): Uint8Array {
-    const dirBytes = new Uint8Array(geo.sectorsPerCluster * geo.bytesPerSector);
+    const dirAlloc = allocation.directories.find((d) => d.node === dirNode);
+    const clusterCount = dirAlloc?.clusterCount || 1;
+    const dirBytes = new Uint8Array(clusterCount * geo.sectorsPerCluster * geo.bytesPerSector);
     let dirOffset = 0;
+    const usedNames = new Set<string>();
 
     if (dirNode === this.root && geo.fatType === FatType.FAT32) {
       // Root dir in FAT32 has volume label
       dirOffset += this.writeVolumeLabelEntry(dirBytes.subarray(dirOffset), geo.volumeLabel);
     } else {
       // Subdirectory starts with '.' and '..'
-      const dirAlloc = allocation.directories.find((d) => d.node === dirNode);
       const startClus = dirAlloc?.startCluster || 0;
 
       // '.'
@@ -350,7 +371,8 @@ export class FatBuilder {
         child.isDirectory,
         startClus,
         size,
-        child.modifiedTime
+        child.modifiedTime,
+        usedNames
       );
     }
 
@@ -394,13 +416,7 @@ export class FatBuilder {
     // Pad last cluster with zeros
     const padBytes = totalClusterBytes - bytesWritten;
     if (padBytes > 0) {
-      const zeroChunk = new Uint8Array(Math.min(65536, padBytes));
-      let remainingPad = padBytes;
-      while (remainingPad > 0) {
-        const toWrite = Math.min(zeroChunk.byteLength, remainingPad);
-        await writer.write(toWrite === zeroChunk.byteLength ? zeroChunk : zeroChunk.subarray(0, toWrite));
-        remainingPad -= toWrite;
-      }
+      await writer.write(new Uint8Array(padBytes));
     }
   }
 
@@ -510,7 +526,7 @@ export class FatBuilder {
     disk[2] = 0x90;
 
     // OEM Name
-    this.writeAscii(disk, 3, 'ISOWEB  ', 8);
+    this.writeAscii(disk, 3, 'DISKWEB ', 8);
 
     // BPB Common
     this.writeUint16LE(disk, 11, geo.bytesPerSector);
@@ -594,6 +610,26 @@ export class FatBuilder {
     this.writeUint32LE(disk, offset + 508, 0xaa550000);
   }
 
+  private calculateDirRequiredClusters(
+    dirNode: VNode,
+    clusterSizeBytes: number,
+    isRoot: boolean,
+    fatType: FatType
+  ): number {
+    if (isRoot && fatType !== FatType.FAT32) {
+      return 0; // FAT12/16 root directory is fixed in reserved root directory sectors
+    }
+    // Subdirectories have '.' and '..' (2 entries)
+    // FAT32 root has volume label entry (1 entry)
+    let totalEntries = isRoot ? 1 : 2;
+    for (const child of dirNode.children || []) {
+      const lfnEntries = Math.ceil(child.name.length / 13);
+      totalEntries += 1 + lfnEntries;
+    }
+    const totalBytes = totalEntries * 32;
+    return Math.max(1, Math.ceil(totalBytes / clusterSizeBytes));
+  }
+
   private async allocateClusters(geo: ReturnType<typeof this.computeGeometry>) {
     const clusterSizeBytes = geo.sectorsPerCluster * geo.bytesPerSector;
     const fatTable: number[] = [
@@ -601,16 +637,20 @@ export class FatBuilder {
       geo.fatType === FatType.FAT32 ? 0x0fffffff : geo.fatType === FatType.FAT16 ? 0xffff : 0x0fff,
     ];
 
+    const files: AllocatedItem[] = [];
+    const directories: { node: VNode; startCluster: number; clusterCount: number }[] = [];
+    const parentMap = new Map<VNode, VNode>();
+
     let nextFreeCluster = 2;
     if (geo.fatType === FatType.FAT32) {
-      // Cluster 2 reserved for root directory
-      fatTable[2] = 0x0fffffff;
-      nextFreeCluster = 3;
+      const rootClusters = this.calculateDirRequiredClusters(this.root, clusterSizeBytes, true, geo.fatType);
+      for (let c = 0; c < rootClusters; c++) {
+        const cluster = 2 + c;
+        fatTable[cluster] = c === rootClusters - 1 ? 0x0fffffff : cluster + 1;
+      }
+      directories.push({ node: this.root, startCluster: 2, clusterCount: rootClusters });
+      nextFreeCluster = 2 + rootClusters;
     }
-
-    const files: AllocatedItem[] = [];
-    const directories: { node: VNode; startCluster: number }[] = [];
-    const parentMap = new Map<VNode, VNode>();
 
     const allocateNode = (node: VNode, parentNode?: VNode) => {
       if (parentNode) {
@@ -618,18 +658,17 @@ export class FatBuilder {
       }
       const isRoot = node === this.root;
       if (node.isDirectory) {
-        let dirCluster = 0;
         if (!isRoot) {
-          dirCluster = nextFreeCluster++;
-          fatTable[dirCluster] =
-            geo.fatType === FatType.FAT32
-              ? 0x0fffffff
-              : geo.fatType === FatType.FAT16
-              ? 0xffff
-              : 0x0fff;
-          directories.push({ node, startCluster: dirCluster });
-        } else if (geo.fatType === FatType.FAT32) {
-          directories.push({ node, startCluster: 2 });
+          const dirClusters = this.calculateDirRequiredClusters(node, clusterSizeBytes, false, geo.fatType);
+          const startCluster = nextFreeCluster;
+          for (let c = 0; c < dirClusters; c++) {
+            const current = nextFreeCluster++;
+            fatTable[current] =
+              c === dirClusters - 1
+                ? (geo.fatType === FatType.FAT32 ? 0x0fffffff : geo.fatType === FatType.FAT16 ? 0xffff : 0x0fff)
+                : current + 1;
+          }
+          directories.push({ node, startCluster, clusterCount: dirClusters });
         }
 
         for (const child of node.children || []) {
@@ -678,17 +717,16 @@ export class FatBuilder {
     };
   }
 
-
-
   private writeDirEntryWithLfn(
     dest: Uint8Array,
     fullName: string,
     isDirectory: boolean,
     startCluster: number,
     size: number,
-    date: Date
+    date: Date,
+    usedNames: Set<string>
   ): number {
-    const short83 = this.generateShortName(fullName);
+    const short83 = this.generateShortName(fullName, usedNames);
     const checksum = this.calculateLfnChecksum(short83);
 
     // If filename needs LFN (contains lowercase, spaces, or >8.3)
@@ -758,11 +796,55 @@ export class FatBuilder {
     return 32;
   }
 
-  private generateShortName(name: string): string {
-    const parts = name.toUpperCase().split('.');
-    const base = (parts[0] || 'FILE').replace(/[^A-Z0-9_]/g, '_').slice(0, 8);
-    const ext = (parts[1] || '').replace(/[^A-Z0-9_]/g, '_').slice(0, 3);
-    return base.padEnd(8, ' ') + ext.padEnd(3, ' ');
+  private generateShortName(name: string, usedNames: Set<string>): string {
+    const lastDot = name.lastIndexOf('.');
+    let rawBase: string;
+    let rawExt: string;
+    if (lastDot >= 0) {
+      rawBase = name.substring(0, lastDot).replace(/\./g, '_');
+      rawExt = name.substring(lastDot + 1);
+    } else {
+      rawBase = name;
+      rawExt = '';
+    }
+    const cleanBase = rawBase.toUpperCase().replace(/[^A-Z0-9_]/g, '') || 'FILE';
+    const cleanExt = rawExt.toUpperCase().replace(/[^A-Z0-9_]/g, '').slice(0, 3);
+
+    // If pure 8.3 without LFN characters and not colliding:
+    if (
+      name.toUpperCase() === name &&
+      !name.includes(' ') &&
+      !name.includes('+') &&
+      !name.includes(',') &&
+      !name.includes(';') &&
+      !name.includes('=') &&
+      !name.includes('[') &&
+      !name.includes(']') &&
+      rawBase.length <= 8 &&
+      cleanExt.length <= 3 &&
+      lastDot === name.indexOf('.')
+    ) {
+      const candidate = cleanBase.slice(0, 8).padEnd(8, ' ') + cleanExt.padEnd(3, ' ');
+      if (!usedNames.has(candidate)) {
+        usedNames.add(candidate);
+        return candidate;
+      }
+    }
+
+    // Otherwise generate unique 8.3 with numeric tail (~1, ~2, ...)
+    let num = 1;
+    while (num < 100000) {
+      const numStr = `~${num}`;
+      const baseLen = Math.max(1, 8 - numStr.length);
+      const base = cleanBase.slice(0, baseLen) + numStr;
+      const candidate = base.padEnd(8, ' ') + cleanExt.padEnd(3, ' ');
+      if (!usedNames.has(candidate)) {
+        usedNames.add(candidate);
+        return candidate;
+      }
+      num++;
+    }
+    return cleanBase.slice(0, 8).padEnd(8, ' ') + cleanExt.padEnd(3, ' ');
   }
 
   private calculateLfnChecksum(shortName: string): number {

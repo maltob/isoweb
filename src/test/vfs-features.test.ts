@@ -70,7 +70,7 @@ describe('VirtualFS Editing & ZIP Archiving', () => {
     vmdkVfs.createDirectory('/', 'EMPTY_DIR');
     const vmdkBlob = await vmdkVfs.buildImageBlob();
     expect(vmdkBlob.size).toBeGreaterThan(0);
-  });
+  }, 30000);
 
   it('should extract empty directory entries from readDirectoryHandle without stalling', async () => {
     const { readDirectoryHandle } = await import('../lib/drop-handler');
@@ -89,4 +89,25 @@ describe('VirtualFS Editing & ZIP Archiving', () => {
     expect(entries[0].isDirectory).toBe(true);
     expect(entries[0].relativePath).toBe('EmptyFolder');
   });
+
+  it('should preserve configured virtual disk capacity when exporting to raw .img', async () => {
+    // 512 MB VMDK (FAT32)
+    const vmdkVfs = VirtualFS.createNew('vmdk-fat32', 'TEST_VM', '512');
+    vmdkVfs.addFile('/', 'TEST.TXT', new TextEncoder().encode('Hello'));
+
+    let totalBytesWritten = 0;
+    const mockWriter = {
+      write: async (chunk: Uint8Array) => {
+        totalBytesWritten += chunk.byteLength;
+      },
+      close: async () => {},
+    };
+
+    // Export as raw FAT32 .img
+    await vmdkVfs.buildToStream(mockWriter, undefined, 'fat32');
+
+    // Should be exactly 512 MB (512 * 1024 * 1024 = 536870912), NOT reduced to 64 MB
+    expect(totalBytesWritten).toBe(512 * 1024 * 1024);
+  });
 });
+

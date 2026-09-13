@@ -247,4 +247,56 @@ describe('FAT16 & FAT32 Disk Image Builder', () => {
     const data = await parser.readFileData(kernel!);
     expect(new TextDecoder().decode(data)).toBe('OS KERNEL BINARY');
   });
+
+  it('should stream large FAT32 disk image in large chunks with progress reporting', async () => {
+    const rootNode: VNode = {
+      id: 'root',
+      name: '/',
+      path: '/',
+      isDirectory: true,
+      size: 0,
+      modifiedTime: new Date(),
+      children: [
+        {
+          id: 'test-doc',
+          name: 'HELLO.TXT',
+          path: '/HELLO.TXT',
+          isDirectory: false,
+          size: 5,
+          modifiedTime: new Date(),
+          data: new TextEncoder().encode('hello'),
+        },
+      ],
+    };
+
+    const oneGbSectors = 2097152; // 1 GB
+    const builder = new FatBuilder(rootNode, {
+      fatType: FatType.FAT32,
+      volumeLabel: 'BIG_FAT32',
+      totalSectors: oneGbSectors,
+      hasMbr: true,
+    });
+
+    let writeCalls = 0;
+    let totalBytesWritten = 0;
+    const progressReports: { ratio: number; status: string }[] = [];
+
+    const mockWriter = {
+      write: async (chunk: Uint8Array) => {
+        writeCalls++;
+        totalBytesWritten += chunk.byteLength;
+      },
+      close: async () => {},
+    };
+
+    await builder.buildToStream(mockWriter, (ratio, status) => {
+      progressReports.push({ ratio, status });
+    });
+
+    expect(totalBytesWritten).toBe(oneGbSectors * 512);
+    // Before the fix, writeCalls was ~262,144! With 2MB buffer, it should be ~520 calls
+    expect(writeCalls).toBeLessThan(600);
+    expect(progressReports.length).toBeGreaterThan(3);
+    expect(progressReports.some((p) => p.status.includes('Writing disk image:'))).toBe(true);
+  });
 });

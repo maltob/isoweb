@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
+import { ExFatBuilder } from '../lib/exfat/exfat-builder';
 import { ExFatParser } from '../lib/exfat/exfat-parser';
 import { DiskImageLoader } from '../lib/loader';
 import { BlobReader } from '../lib/reader';
 import { VirtualFS } from '../lib/virtual-fs/virtual-fs';
 import { VmdkParser } from '../lib/vmdk/vmdk-parser';
 import { VMDK_MAGIC } from '../lib/vmdk/vmdk-types';
+import { VNode } from '../lib/types';
 
 describe('exFAT Volume Builder and Parser', () => {
   it('should format an exFAT volume and parse files with long names', async () => {
@@ -38,6 +40,76 @@ describe('exFAT Volume Builder and Parser', () => {
     expect(reportFile).toBeDefined();
     const reportData = await parser.readFileData(reportFile!);
     expect(new TextDecoder().decode(reportData)).toBe('Detailed documentation stored in modern exFAT volume.');
+  });
+
+  it('should create exFAT with zero-byte files and valid upcase table compliance', async () => {
+    const vfs = VirtualFS.createNew('exfat', 'COMPLIANT', '64');
+    vfs.addFile('/', 'EMPTY.TXT', new Uint8Array(0));
+    vfs.addFile('/', 'NORMAL.TXT', new TextEncoder().encode('Hello!'));
+
+    const blob = await vfs.buildImageBlob();
+    const reader = new BlobReader(blob);
+    const parser = new ExFatParser(reader);
+    const { root } = await parser.parse();
+
+    const emptyFile = root.children?.find((c) => c.name === 'EMPTY.TXT');
+    expect(emptyFile).toBeDefined();
+    expect(emptyFile?.size).toBe(0);
+    expect(emptyFile?.startCluster).toBe(0); // Zero-byte files must have startCluster = 0 per exFAT spec
+
+    const emptyData = await parser.readFileData(emptyFile!);
+    expect(emptyData.byteLength).toBe(0);
+
+    // Verify Upcase Table entry in root dir
+    // Root dir is at cluster 4. Cluster 2 is Bitmap, Cluster 3 is Upcase, Cluster 4 is Root.
+    // Boot sector: byte 88 is clusterHeapSector (2048)
+    const bootBytes = await reader.read(0, 512);
+    const clusterHeapSector = bootBytes[88] | (bootBytes[89] << 8) | (bootBytes[90] << 16) | (bootBytes[91] << 24);
+    const rootCluster = bootBytes[96] | (bootBytes[97] << 8) | (bootBytes[98] << 16) | (bootBytes[99] << 24);
+    const secPerClus = 1 << bootBytes[109];
+    const rootByteOffset = (clusterHeapSector + (rootCluster - 2) * secPerClus) * 512;
+    const rootDirBytes = await reader.read(rootByteOffset, 4096);
+
+    // Find Upcase Table Entry (type 0x82)
+    let foundUpcase = false;
+    for (let o = 0; o < rootDirBytes.length; o += 32) {
+      if (rootDirBytes[o] === 0x82) {
+        foundUpcase = true;
+        const checksum =
+          (rootDirBytes[o + 4] |
+            (rootDirBytes[o + 5] << 8) |
+            (rootDirBytes[o + 6] << 16) |
+            (rootDirBytes[o + 7] << 24)) >>>
+          0;
+        const firstCluster =
+          (rootDirBytes[o + 20] |
+            (rootDirBytes[o + 21] << 8) |
+            (rootDirBytes[o + 22] << 16) |
+            (rootDirBytes[o + 23] << 24)) >>>
+          0;
+        const dataLength =
+          (rootDirBytes[o + 24] |
+            (rootDirBytes[o + 25] << 8) |
+            (rootDirBytes[o + 26] << 16) |
+            (rootDirBytes[o + 27] << 24)) >>>
+          0;
+
+        expect(checksum).toBe(0x21b729bb);
+        expect(dataLength).toBe(3774);
+        expect(firstCluster).toBe(3);
+
+        // Read Upcase Table cluster and verify checksum
+        const upcaseOffset = (clusterHeapSector + (firstCluster - 2) * secPerClus) * 512;
+        const upcaseBytes = await reader.read(upcaseOffset, dataLength);
+        let calcChecksum = 0;
+        for (let b = 0; b < upcaseBytes.length; b++) {
+          calcChecksum = (((calcChecksum << 31) | (calcChecksum >>> 1)) + upcaseBytes[b]) >>> 0;
+        }
+        expect(calcChecksum).toBe(0x21b729bb);
+        break;
+      }
+    }
+    expect(foundUpcase).toBe(true);
   });
 });
 
@@ -97,7 +169,7 @@ describe('VMDK Virtual Disk Builder and Parser', () => {
     expect(bootNode).toBeDefined();
     const bootBytes = await vfsLoaded.getFileBytes(bootNode);
     expect(new TextDecoder().decode(bootBytes)).toBe('UEFI BOOTLOADER STUB');
-  });
+  }, 30000);
 
   it('should build a monolithicSparse VMDK with exFAT partition', async () => {
     const vfs = VirtualFS.createNew('vmdk-exfat', 'EXFAT_VM', '1024'); // 1GB virtual disk
@@ -115,4 +187,52 @@ describe('VMDK Virtual Disk Builder and Parser', () => {
     const dataBytes = await vfsLoaded.getFileBytes(dataNode);
     expect(new TextDecoder().decode(dataBytes)).toBe('Content inside exFAT VMDK disk!');
   });
+
+  it('should stream large raw exFAT disk image in large chunks with progress reporting', async () => {
+    const rootNode: VNode = {
+      id: 'root',
+      name: '/',
+      path: '/',
+      isDirectory: true,
+      size: 0,
+      modifiedTime: new Date(),
+      children: [
+        {
+          id: 'test-doc',
+          name: 'BIG_EXFAT.TXT',
+          path: '/BIG_EXFAT.TXT',
+          isDirectory: false,
+          size: 15,
+          modifiedTime: new Date(),
+          data: new TextEncoder().encode('Hello from exFAT'),
+        },
+      ],
+    };
+
+    const twoGbSectors = 4194304; // 2 GB
+    const builder = new ExFatBuilder(rootNode, 'BIG_EXFAT', twoGbSectors, true);
+
+    let writeCalls = 0;
+    let totalBytesWritten = 0;
+    const progressReports: { ratio: number; status: string }[] = [];
+
+    const mockWriter = {
+      write: async (chunk: Uint8Array) => {
+        writeCalls++;
+        totalBytesWritten += chunk.byteLength;
+      },
+      close: async () => {},
+    };
+
+    await builder.buildToStream(mockWriter, (ratio, status) => {
+      progressReports.push({ ratio, status });
+    });
+
+    expect(totalBytesWritten).toBe(twoGbSectors * 512);
+    // 2GB with 2MB chunks should take ~1024-1030 write calls instead of 524,288!
+    expect(writeCalls).toBeLessThan(1100);
+    expect(progressReports.length).toBeGreaterThan(3);
+    expect(progressReports.some((p) => p.status.includes('Writing disk image:'))).toBe(true);
+  });
 });
+

@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { Breadcrumbs } from './components/Breadcrumbs';
 import { DiskInfoModal } from './components/DiskInfoModal';
+import { ExportModal, ExportSettings } from './components/ExportModal';
 import { FileTable } from './components/FileTable';
 import { Header } from './components/Header';
 import { InputModal } from './components/InputModal';
@@ -24,19 +25,18 @@ export const App: React.FC = () => {
   // Active Virtual Filesystem
   const [vfs, setVfs] = useState<VirtualFS>(() => {
     // Initial default demo ISO
-    const initial = VirtualFS.createNew('iso', 'ISOWEB_DEMO');
-    const welcomeDoc = `# Welcome to ISOWeb!
-A 100% browser-only, high-performance builder and viewer for VM disk images (.ISO and .IMG).
+    const initial = VirtualFS.createNew('iso', 'DISK_DEMO');
+    const welcomeDoc = `# Welcome to Disk WebUI!
+A 100% browser-only, high-performance builder and viewer for VM disk images (.VHDX, .VMDK, .ISO, .RAW).
 
 Features:
 - Works completely offline with zero server dependencies
-- High-performance slice-based reading for multi-gigabyte files
-- Full ISO 9660 + Joliet (Unicode / Long Filenames) support
-- Full FAT12 (Floppy), FAT16, and FAT32 (.IMG) support
+- High-performance slice-based reading and streaming for multi-gigabyte files
+- Full VHDX, VMDK, ISO 9660 + Joliet, and FAT/exFAT support
 - Built-in Hex Inspector & Text/Image Previews
 - Origin Private File System (OPFS) persistent library
 - Drag-and-drop files directly from your desktop
-- Instant ZIP archive extraction
+- Choose container format, FAT32/exFAT filesystem, and capacity upon Save / Export!
 
 Try adding your own files, creating folders, or clicking "Save / Export" to download your disk image!
 `;
@@ -53,7 +53,7 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
     return initial;
   });
 
-  const [currentFileName, setCurrentFileName] = useState('ISOWEB_DEMO.iso');
+  const [currentFileName, setCurrentFileName] = useState('DISK_DEMO.iso');
   const [currentPath, setCurrentPath] = useState('/');
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedPaths, setSelectedPaths] = useState<Set<string>>(new Set());
@@ -61,6 +61,7 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
   // Modal states
   const [previewNode, setPreviewNode] = useState<VNode | null>(null);
   const [isNewImageOpen, setIsNewImageOpen] = useState(false);
+  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
   const [isDiskInfoOpen, setIsDiskInfoOpen] = useState(false);
   const [isOpfsOpen, setIsOpfsOpen] = useState(false);
   const [inputModalState, setInputModalState] = useState<{
@@ -131,34 +132,92 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
 
   // Create new image
   const handleCreateNew = (
-    format: DiskFormat,
-    volumeLabel: string,
-    sizePreset?: string,
-    hasMbr?: boolean
+    volumeLabel: string = 'NEW_DISK',
+    includeDemoFiles: boolean = false
   ) => {
-    const newVfs = VirtualFS.createNew(format, volumeLabel, sizePreset, hasMbr);
-    const ext = format === 'iso' ? '.iso' : format.startsWith('vmdk') ? '.vmdk' : '.img';
+    const newVfs = VirtualFS.createNew('vhdx-fat32', volumeLabel);
+    if (includeDemoFiles) {
+      const welcomeDoc = `# Welcome to Disk WebUI!
+A 100% browser-only, high-performance builder and viewer for VM disk images (.VHDX, .VMDK, .ISO, .RAW).
+
+Features:
+- Works completely offline with zero server dependencies
+- High-performance slice-based reading and streaming for multi-gigabyte files
+- Full VHDX, VMDK, ISO 9660, and FAT/exFAT support
+- Built-in Hex Inspector & Text/Image Previews
+- Origin Private File System (OPFS) persistent library
+- Drag-and-drop files directly from your desktop
+- Choose container format, FAT32/exFAT filesystem, and capacity upon Save / Export!
+`;
+      newVfs.addFile('/', 'README.TXT', new TextEncoder().encode(welcomeDoc));
+      newVfs.createDirectory('/', 'BOOT');
+      const sampleConfig = `TIMEOUT 5\nDEFAULT linux\n\nLABEL linux\n  KERNEL /BOOT/VMLINUZ\n  APPEND initrd=/BOOT/INITRD.IMG root=/dev/ram0\n`;
+      newVfs.addFile('/BOOT', 'ISOLINUX.CFG', new TextEncoder().encode(sampleConfig));
+    }
     setVfs(newVfs);
-    setCurrentFileName(`${volumeLabel.toLowerCase()}${ext}`);
+    setCurrentFileName(`${volumeLabel.toLowerCase()}.vhdx`);
     setCurrentPath('/');
     setSelectedPaths(new Set());
   };
 
   // Download / Save to computer (Streams directly to hard drive with File System Access API)
-  const handleSaveImage = async () => {
-    const format = vfs.getFormat();
-    const ext = format === 'iso' ? '.iso' : format.startsWith('vmdk') ? '.vmdk' : '.img';
-    const description = format.startsWith('vmdk')
-      ? 'VMware / VirtualBox VMDK Virtual Disk'
+  const handleSaveImage = async (
+    overrideFormat?: DiskFormat,
+    customOptions?: { volumeLabel?: string; capacityMb?: number; forceBrowserDownload?: boolean }
+  ) => {
+    const format = overrideFormat || vfs.getFormat();
+    const ext =
+      format === 'iso'
+        ? '.iso'
+        : format.startsWith('vmdk')
+        ? '.vmdk'
+        : format.startsWith('vhdx')
+        ? '.vhdx'
+        : format === 'fat12'
+        ? '.img'
+        : '.raw';
+
+    const description = format.startsWith('vhdx')
+      ? 'Microsoft Hyper-V VHDX Virtual Disk (*.vhdx)'
+      : format.startsWith('vmdk')
+      ? 'VMware / VirtualBox VMDK Virtual Disk (*.vmdk)'
       : format === 'iso'
-      ? 'ISO 9660 Disc Image'
-      : 'Raw VM Disk Image';
+      ? 'ISO 9660 Disc Image (*.iso)'
+      : format === 'fat12'
+      ? 'Floppy Disk Image (*.img)'
+      : 'Raw Hard Disk Image (*.raw, *.img)';
+
+    const mimeType = format.startsWith('vhdx')
+      ? 'application/x-vhdx'
+      : format.startsWith('vmdk')
+      ? 'application/x-vmdk'
+      : format === 'iso'
+      ? 'application/x-iso9660-image'
+      : 'application/octet-stream';
+
+    const baseName = (customOptions?.volumeLabel || currentFileName).replace(/\.[^/.]+$/, '');
+    const defaultName = `${baseName}${ext}`;
+
+    const exportOpts = {
+      format,
+      volumeLabel: customOptions?.volumeLabel,
+      capacityMb: customOptions?.capacityMb,
+    };
 
     // Check if File System Access API is available for direct disk streaming
-    if ('showSaveFilePicker' in window) {
+    if (!customOptions?.forceBrowserDownload && 'showSaveFilePicker' in window) {
       try {
-        const baseName = currentFileName.replace(/\.[^/.]+$/, '');
-        const defaultName = currentFileName.endsWith(ext) ? currentFileName : `${baseName}${ext}`;
+        const acceptExtensions =
+          format === 'fat12'
+            ? ['.img', '.ima', '.flp']
+            : format === 'iso'
+            ? ['.iso']
+            : format.startsWith('vmdk')
+            ? ['.vmdk']
+            : format.startsWith('vhdx')
+            ? ['.vhdx']
+            : ['.raw', '.img', '.bin'];
+
         // @ts-expect-error showSaveFilePicker is standard in Chromium/Edge
         const fileHandle: FileSystemFileHandle = await window.showSaveFilePicker({
           suggestedName: defaultName,
@@ -166,16 +225,22 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
             {
               description,
               accept: {
-                'application/octet-stream': [ext],
+                [mimeType]: [ext],
+                'application/octet-stream': acceptExtensions,
               },
             },
           ],
         });
 
-        setProgressState({ visible: true, ratio: 0, status: 'Streaming image directly to disk...' });
-        await vfs.buildToDisk(fileHandle, (ratio, status) => {
-          setProgressState({ visible: true, ratio, status });
-        });
+        setProgressState({ visible: true, ratio: 0, status: `Streaming ${ext.toUpperCase()} directly to disk...` });
+        await vfs.buildToDisk(
+          fileHandle,
+          (ratio, status) => {
+            setProgressState({ visible: true, ratio, status });
+          },
+          exportOpts
+        );
+        setCurrentFileName(fileHandle.name);
         setProgressState({ visible: false, ratio: 1, status: 'Saved to disk!' });
         return;
       } catch (err: any) {
@@ -186,16 +251,33 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
 
     // Fallback to in-memory/blob download
     try {
-      setProgressState({ visible: true, ratio: 0, status: 'Building disk image...' });
+      setProgressState({ visible: true, ratio: 0, status: `Building ${ext.toUpperCase()} disk image...` });
       const blob = await vfs.buildImageBlob((ratio, status) => {
         setProgressState({ visible: true, ratio, status });
-      });
-      downloadBlob(blob, currentFileName);
+      }, exportOpts);
+      downloadBlob(blob, defaultName);
+      setCurrentFileName(defaultName);
       setProgressState({ visible: false, ratio: 1, status: 'Completed' });
     } catch (e) {
       setProgressState({ visible: false, ratio: 0, status: '' });
       alert(`Failed to save image: ${e}`);
     }
+  };
+
+  // Handler for ExportModal submission
+  const handleExportFromModal = async (settings: ExportSettings) => {
+    if (settings.isZip) {
+      setIsExportModalOpen(false);
+      await handleExportZip();
+      return;
+    }
+
+    setIsExportModalOpen(false);
+    await handleSaveImage(settings.format, {
+      volumeLabel: settings.volumeLabel,
+      capacityMb: settings.capacityMb,
+      forceBrowserDownload: settings.forceBrowserDownload,
+    });
   };
 
   // Save to OPFS (Streams directly into OPFS sandbox with Zero RAM used!)
@@ -332,7 +414,8 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
         lower.endsWith('.img') ||
         lower.endsWith('.ima') ||
         lower.endsWith('.vfd') ||
-        lower.endsWith('.vmdk')
+        lower.endsWith('.vmdk') ||
+        lower.endsWith('.vhdx')
       ) {
         if (confirm(`Would you like to open "${first.name}" as a VM disk image?`)) {
           handleOpenFile(first);
@@ -475,6 +558,7 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
         rootSize={vfs.getRoot().size}
         onNewImage={() => setIsNewImageOpen(true)}
         onOpenFile={handleOpenFile}
+        onOpenExportModal={() => setIsExportModalOpen(true)}
         onSaveImage={handleSaveImage}
         onSaveToOpfs={handleSaveToOpfs}
         onExportZip={handleExportZip}
@@ -536,6 +620,18 @@ Try adding your own files, creating folders, or clicking "Save / Export" to down
         <NewImageModal
           onClose={() => setIsNewImageOpen(false)}
           onCreate={handleCreateNew}
+        />
+      )}
+
+      {/* Save & Export Options Modal */}
+      {isExportModalOpen && (
+        <ExportModal
+          isOpen={isExportModalOpen}
+          onClose={() => setIsExportModalOpen(false)}
+          vfs={vfs}
+          currentFileName={currentFileName}
+          onExport={handleExportFromModal}
+          isSaving={progressState.visible}
         />
       )}
 
