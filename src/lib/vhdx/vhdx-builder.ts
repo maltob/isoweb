@@ -2,21 +2,12 @@
 // Builds dynamic (sparse) VHDX images formatted with FAT32 or exFAT partitions.
 // 100% browser-only and zero-RAM streaming compatible.
 
-import { ExFatBuilder } from '../exfat/exfat-builder';
-import { FatBuilder } from '../fat/fat-builder';
-import { FatType } from '../fat/fat-types';
 import { BlobAccumulatorWriter, ImageStreamWriter } from '../storage/stream-writer';
 import { VNode } from '../types';
+import { FileSystemRegistry } from '../filesystem/fs-registry';
 import {
   computeCrc32c,
   generateRandomGuid,
-  GUID_BAT_REGION,
-  GUID_FILE_PARAMETERS,
-  GUID_LOGICAL_SECTOR_SIZE,
-  GUID_METADATA_REGION,
-  GUID_PHYSICAL_SECTOR_SIZE,
-  GUID_VIRTUAL_DISK_ID,
-  GUID_VIRTUAL_DISK_SIZE,
   guidToBytes,
   VHDX_ALIGNMENT,
   VHDX_DEFAULT_BLOCK_SIZE,
@@ -28,10 +19,17 @@ import {
   VhdxPayloadBlockState,
   VhdxSectorBitmapBlockState,
   VHDX_REGION_SIGNATURE,
+  GUID_BAT_REGION,
+  GUID_FILE_PARAMETERS,
+  GUID_LOGICAL_SECTOR_SIZE,
+  GUID_METADATA_REGION,
+  GUID_PHYSICAL_SECTOR_SIZE,
+  GUID_VIRTUAL_DISK_ID,
+  GUID_VIRTUAL_DISK_SIZE,
 } from './vhdx-types';
 
 export interface VhdxBuilderOptions {
-  fsType: 'fat32' | 'exfat';
+  fsType: 'fat32' | 'exfat' | 'ntfs' | 'xfs';
   volumeLabel?: string;
   capacitySectors?: number; // Virtual disk capacity in 512-byte sectors (default: 1 GB = 2097152 sectors)
 }
@@ -67,23 +65,18 @@ export class VhdxBuilder {
     const partitionStartSector = 2048;
     const partitionSectors = this.options.capacitySectors - partitionStartSector;
 
-    let partitionBlob: Blob;
-    if (this.options.fsType === 'fat32') {
-      const fatBuilder = new FatBuilder(this.root, {
-        fatType: FatType.FAT32,
-        volumeLabel: this.options.volumeLabel,
-        totalSectors: partitionSectors,
-        hasMbr: false, // inner partition
-        hiddenSectors: partitionStartSector,
-        padToCapacity: false,
-      });
-      partitionBlob = await fatBuilder.buildBlob();
-    } else {
-      const exfatBuilder = new ExFatBuilder(this.root, this.options.volumeLabel, partitionSectors, false, partitionStartSector);
-      const acc = new BlobAccumulatorWriter('application/octet-stream');
-      await exfatBuilder.buildToStream(acc);
-      partitionBlob = acc.getBlob();
-    }
+    const driver = FileSystemRegistry.getDriver(this.options.fsType);
+    const fsBuilder = driver.createBuilder(this.root, {
+      volumeLabel: this.options.volumeLabel,
+      partitionSectors,
+      partitionStartSector,
+      padToCapacity: false,
+    });
+    const acc = new BlobAccumulatorWriter('application/octet-stream');
+    await fsBuilder.buildToStream(acc, (r, s) => {
+      onProgress?.(0.05 + r * 0.25, s);
+    });
+    const partitionBlob = acc.getBlob();
 
     onProgress?.(0.3, 'Allocating VHDX structures & BAT...');
 
@@ -96,7 +89,7 @@ export class VhdxBuilder {
     mbrSector[447] = 0x20; // Head 32
     mbrSector[448] = 0x21; // Sector 33
     mbrSector[449] = 0x00; // Cyl 0
-    mbrSector[450] = this.options.fsType === 'fat32' ? 0x0c : 0x07; // 0x0C = FAT32 LBA, 0x07 = exFAT
+    mbrSector[450] = driver.mbrPartitionType ?? (this.options.fsType === 'fat32' ? 0x0c : 0x07);
     mbrSector[451] = 0xfe; // End Head
     mbrSector[452] = 0xff; // End Sec/Cyl
     mbrSector[453] = 0xff;
@@ -187,6 +180,34 @@ export class VhdxBuilder {
           const offsetMb = BigInt(currentPhysicalOffset / VHDX_ALIGNMENT);
           batEntries[batIndex] = (offsetMb << 20n) | BigInt(VhdxPayloadBlockState.FullyPresent);
           activePartitionBlocks.push(p);
+          currentPhysicalOffset += blockSize;
+        }
+      }
+    }
+
+    // Ensure Backup VBR at the last sector of the partition (required for NTFS)
+    const isNtfs = this.options.fsType === 'ntfs';
+    let needsDedicatedBackupBlock = false;
+    let backupBlockIndex = -1;
+    let backupSectorOffsetInBlock = 0;
+    let primaryVbrBytes: Uint8Array | null = null;
+
+    if (isNtfs) {
+      primaryVbrBytes = new Uint8Array(await partitionBlob.slice(0, 512).arrayBuffer());
+      const backupVbrSector = partitionStartSector + partitionSectors - 1;
+      const backupVbrByteOffset = backupVbrSector * logicalSectorSize;
+      backupBlockIndex = Math.floor(backupVbrByteOffset / blockSize);
+      backupSectorOffsetInBlock = backupVbrByteOffset % blockSize;
+
+      if (backupBlockIndex === 0) {
+        block0Data.set(primaryVbrBytes, backupSectorOffsetInBlock);
+      } else {
+        const partitionBlockIndex = backupBlockIndex - 1;
+        if (!activePartitionBlocks.includes(partitionBlockIndex)) {
+          needsDedicatedBackupBlock = true;
+          const batIndex = backupBlockIndex + Math.floor(backupBlockIndex / chunkRatio);
+          const offsetMb = BigInt(currentPhysicalOffset / VHDX_ALIGNMENT);
+          batEntries[batIndex] = (offsetMb << 20n) | BigInt(VhdxPayloadBlockState.FullyPresent);
           currentPhysicalOffset += blockSize;
         }
       }
@@ -351,17 +372,28 @@ export class VhdxBuilder {
       const pStart = p * blockSize;
       const pEnd = Math.min(pStart + blockSize, partitionBlob.size);
       const slice = new Uint8Array(await partitionBlob.slice(pStart, pEnd).arrayBuffer());
-      if (slice.byteLength === blockSize) {
-        await writer.write(slice);
-      } else {
-        const padded = new Uint8Array(blockSize);
-        padded.set(slice, 0);
-        await writer.write(padded);
+      const blockData = slice.byteLength === blockSize ? slice : new Uint8Array(blockSize);
+      if (slice.byteLength !== blockSize) {
+        blockData.set(slice, 0);
       }
+
+      // If this block contains the backup VBR, write it
+      if (isNtfs && primaryVbrBytes && backupBlockIndex - 1 === p) {
+        blockData.set(primaryVbrBytes, backupSectorOffsetInBlock);
+      }
+
+      await writer.write(blockData);
       onProgress?.(
         0.85 + ((i + 1) / Math.max(1, activePartitionBlocks.length)) * 0.14,
         `Streaming block ${i + 1} / ${activePartitionBlocks.length}...`
       );
+    }
+
+    // Write dedicated backup VBR block if it wasn't within active partition blocks
+    if (needsDedicatedBackupBlock && primaryVbrBytes) {
+      const backupBlock = new Uint8Array(blockSize);
+      backupBlock.set(primaryVbrBytes, backupSectorOffsetInBlock);
+      await writer.write(backupBlock);
     }
 
     onProgress?.(1.0, 'VHDX dynamic virtual disk created successfully.');

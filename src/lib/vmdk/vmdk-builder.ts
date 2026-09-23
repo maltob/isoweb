@@ -1,10 +1,8 @@
 // High-performance VMDK (monolithicSparse) builder
 // Creates VMware / VirtualBox / QEMU compatible virtual hard disks with FAT32 or exFAT
-import { ExFatBuilder } from '../exfat/exfat-builder';
-import { FatBuilder } from '../fat/fat-builder';
-import { FatType } from '../fat/fat-types';
 import { BlobAccumulatorWriter, ImageStreamWriter } from '../storage/stream-writer';
 import { VNode } from '../types';
+import { FileSystemRegistry } from '../filesystem/fs-registry';
 import {
   VMDK_DEFAULT_GRAIN_SIZE,
   VMDK_FLAG_NL_TEST,
@@ -14,7 +12,7 @@ import {
   VMDK_VERSION,
 } from './vmdk-types';
 
-export type VmdkFsType = 'fat32' | 'exfat';
+export type VmdkFsType = 'fat32' | 'exfat' | 'ntfs' | 'xfs';
 
 export interface VmdkBuilderOptions {
   fsType: VmdkFsType;
@@ -74,27 +72,18 @@ export class VmdkBuilder {
     const partitionStartSector = 2048;
     const partitionSectors = capacitySectors - partitionStartSector;
 
-    let partitionBlob: Blob;
-    if (this.options.fsType === 'fat32') {
-      const fatBuilder = new FatBuilder(this.root, {
-        fatType: FatType.FAT32,
-        volumeLabel: this.options.volumeLabel,
-        totalSectors: partitionSectors,
-        hasMbr: false, // inner partition
-        hiddenSectors: partitionStartSector,
-        padToCapacity: false,
-      });
-      partitionBlob = await fatBuilder.buildBlob((r, s) => {
-        onProgress?.(0.05 + r * 0.45, `Building FAT32: ${s}`);
-      });
-    } else {
-      const exfatBuilder = new ExFatBuilder(this.root, this.options.volumeLabel, partitionSectors, false, partitionStartSector);
-      const acc = new BlobAccumulatorWriter('application/octet-stream');
-      await exfatBuilder.buildToStream(acc, (r, s) => {
-        onProgress?.(0.05 + r * 0.45, `Building exFAT: ${s}`);
-      });
-      partitionBlob = acc.getBlob();
-    }
+    const driver = FileSystemRegistry.getDriver(this.options.fsType);
+    const fsBuilder = driver.createBuilder(this.root, {
+      volumeLabel: this.options.volumeLabel || 'VMDK_DISK',
+      partitionSectors,
+      partitionStartSector,
+      padToCapacity: false,
+    });
+    const acc = new BlobAccumulatorWriter('application/octet-stream');
+    await fsBuilder.buildToStream(acc, (r, s) => {
+      onProgress?.(0.05 + r * 0.45, `Building ${driver.name}: ${s}`);
+    });
+    const partitionBlob = acc.getBlob();
 
     onProgress?.(0.55, 'Creating VMDK sparse tables...');
 
@@ -107,7 +96,7 @@ export class VmdkBuilder {
     mbrSector[447] = 0x20; // Start Head (32)
     mbrSector[448] = 0x21; // Start Sector (33)
     mbrSector[449] = 0x00; // Start Cyl (0)
-    mbrSector[450] = this.options.fsType === 'fat32' ? 0x0c : 0x07; // 0x0C = FAT32 LBA, 0x07 = exFAT
+    mbrSector[450] = driver.mbrPartitionType ?? (this.options.fsType === 'fat32' ? 0x0c : 0x07);
     mbrSector[451] = 0xfe; // End Head
     mbrSector[452] = 0xff; // End Sector/Cylinder
     mbrSector[453] = 0xff;
@@ -158,6 +147,25 @@ export class VmdkBuilder {
         const grainData = new Uint8Array(grainBytes);
         grainData.set(slice, 0);
         grainsToWrite.push({ virtualGrain, physicalSector: currentPhysicalSector, data: grainData });
+        currentPhysicalSector += grainSize;
+      }
+    }
+
+    // Ensure Backup VBR at the last sector of the partition (required for NTFS)
+    if (this.options.fsType === 'ntfs') {
+      const primaryVbr = partitionBytes.subarray(0, 512);
+      const lastSector = capacitySectors - 1;
+      const lastVirtualGrain = Math.floor(lastSector / grainSize);
+      const lastSectorOffsetInGrain = (lastSector % grainSize) * VMDK_SECTOR_SIZE;
+
+      const existing = grainsToWrite.find(gw => gw.virtualGrain === lastVirtualGrain);
+      if (existing) {
+        existing.data.set(primaryVbr, lastSectorOffsetInGrain);
+      } else if (lastVirtualGrain < grainTableEntries.length) {
+        grainTableEntries[lastVirtualGrain] = currentPhysicalSector;
+        const grainData = new Uint8Array(grainBytes);
+        grainData.set(primaryVbr, lastSectorOffsetInGrain);
+        grainsToWrite.push({ virtualGrain: lastVirtualGrain, physicalSector: currentPhysicalSector, data: grainData });
         currentPhysicalSector += grainSize;
       }
     }

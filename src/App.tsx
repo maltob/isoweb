@@ -206,6 +206,7 @@ Features:
 
     // Check if File System Access API is available for direct disk streaming
     if (!customOptions?.forceBrowserDownload && 'showSaveFilePicker' in window) {
+      let fileHandle: FileSystemFileHandle | undefined;
       try {
         const acceptExtensions =
           format === 'fat12'
@@ -219,7 +220,7 @@ Features:
             : ['.raw', '.img', '.bin'];
 
         // @ts-expect-error showSaveFilePicker is standard in Chromium/Edge
-        const fileHandle: FileSystemFileHandle = await window.showSaveFilePicker({
+        fileHandle = await window.showSaveFilePicker({
           suggestedName: defaultName,
           types: [
             {
@@ -232,20 +233,29 @@ Features:
           ],
         });
 
-        setProgressState({ visible: true, ratio: 0, status: `Streaming ${ext.toUpperCase()} directly to disk...` });
-        await vfs.buildToDisk(
-          fileHandle,
-          (ratio, status) => {
-            setProgressState({ visible: true, ratio, status });
-          },
-          exportOpts
-        );
-        setCurrentFileName(fileHandle.name);
-        setProgressState({ visible: false, ratio: 1, status: 'Saved to disk!' });
-        return;
       } catch (err: any) {
         if (err.name === 'AbortError') return; // user cancelled file picker
-        console.warn('showSaveFilePicker error, falling back to browser download:', err);
+        console.warn('Save picker unavailable; falling back to browser download:', err);
+      }
+
+      if (fileHandle) {
+        setProgressState({ visible: true, ratio: 0, status: `Streaming ${ext.toUpperCase()} directly to disk...` });
+        try {
+          await vfs.buildToDisk(
+            fileHandle,
+            (ratio, status) => {
+              setProgressState({ visible: true, ratio, status });
+            },
+            exportOpts
+          );
+          setCurrentFileName(fileHandle.name);
+          setProgressState({ visible: false, ratio: 1, status: 'Saved to disk!' });
+          return;
+        } catch (err) {
+          setProgressState({ visible: false, ratio: 0, status: '' });
+          alert(`Failed to stream image to disk: ${err}`);
+          return;
+        }
       }
     }
 

@@ -2,10 +2,17 @@
 
 A 100% client-side, offline, high-performance VM disk image builder, viewer, and editor for `.VHDX` (Hyper-V), `.VMDK` (VMware / VirtualBox), `.ISO` (ISO 9660 + Joliet), and `.IMG` / `.RAW` (FAT12, FAT16, FAT32, and exFAT) formats.
 
+**Live version:** [maltob.github.io/isoweb](https://maltob.github.io/isoweb/)
+
 ## Key Features
 
 - **100% Offline & Browser-Only**: Zero server dependencies, zero telemetry, full client-side privacy.
-- **High-Performance Slice-Based Reading**: Opens multi-gigabyte ISO and IMG images instantaneously by lazily streaming sector blocks on demand using `Blob.slice()` and OPFS access handles.
+- **High-Performance Slice-Based Reading**: Opens multi-gigabyte ISO, IMG, VHDX, and VMDK images instantaneously by lazily streaming sector blocks on demand using `Blob.slice()` and OPFS access handles.
+- **NTFS & exFAT Support**:
+  - Full Master File Table (`$MFT`), `$MFTMirr`, `$LogFile`, `$Volume`, `$AttrDef`, `$Bitmap`, `$Boot`, `$BadClust`, `$Secure`, `$UpCase`, and `$Extend` system files generation.
+  - Large Index (`$INDEX_ALLOCATION` + `INDX` blocks) & Resident directory indexes with Update Sequence Array (USA) fixups.
+  - Standard Information (NTFS 3.1), File Name (Unicode / Win32 & DOS), Resident and Non-Resident `$DATA` run-length encoding.
+  - Full NTFS support across Raw disk images, `.VHDX` (Hyper-V), and `.VMDK` (VMware / VirtualBox) virtual hard disks.
 - **ISO 9660 + Joliet Support**:
   - Full Primary Volume Descriptor (PVD) and Supplementary Volume Descriptor (SVD) generation and parsing.
   - UCS-2 Big Endian Unicode support for long filenames and mixed case.

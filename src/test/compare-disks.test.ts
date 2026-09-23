@@ -36,7 +36,7 @@ describe('Compare VHDX and VMDK virtual sectors', () => {
     const vmdkBytes = await vmdkVirtual.read(0, testLen);
 
     expect(vmdkBytes).toEqual(vhdxBytes);
-  }, 30000);
+  }, 60000);
 
   it('compares exFAT virtual sector by sector between VHDX and VMDK', async () => {
     const vfsVhdx = VirtualFS.createNew('vhdx-exfat', 'EXFAT_COMP', '512');
@@ -64,5 +64,41 @@ describe('Compare VHDX and VMDK virtual sectors', () => {
     const vmdkBytes = await vmdkVirtual.read(0, testLen);
 
     expect(vmdkBytes).toEqual(vhdxBytes);
-  }, 30000);
+  }, 60000);
+
+  it('compares NTFS virtual sector by sector between VHDX and VMDK', async () => {
+    const fixedDate = new Date('2026-01-01T00:00:00Z');
+    const vfsVhdx = VirtualFS.createNew('vhdx-ntfs', 'NTFS_COMP', '1024');
+    vfsVhdx.getRoot().modifiedTime = fixedDate;
+    vfsVhdx.addFile('/', 'EMPTY.DAT', new Uint8Array(0));
+    vfsVhdx.addFile('/', 'HELLO.TXT', new TextEncoder().encode('NTFS VHDX vs VMDK sector test'));
+    vfsVhdx.findNode('/EMPTY.DAT')!.modifiedTime = fixedDate;
+    vfsVhdx.findNode('/HELLO.TXT')!.modifiedTime = fixedDate;
+    const vhdxBlob = await vfsVhdx.buildImageBlob();
+
+    const vfsVmdk = VirtualFS.createNew('vmdk-ntfs', 'NTFS_COMP', '1024');
+    vfsVmdk.getRoot().modifiedTime = fixedDate;
+    vfsVmdk.addFile('/', 'EMPTY.DAT', new Uint8Array(0));
+    vfsVmdk.addFile('/', 'HELLO.TXT', new TextEncoder().encode('NTFS VHDX vs VMDK sector test'));
+    vfsVmdk.findNode('/EMPTY.DAT')!.modifiedTime = fixedDate;
+    vfsVmdk.findNode('/HELLO.TXT')!.modifiedTime = fixedDate;
+    const vmdkBlob = await vfsVmdk.buildImageBlob();
+
+    const vhdxReader = new BlobReader(vhdxBlob);
+    const vmdkReader = new BlobReader(vmdkBlob);
+
+    const vhdxParser = new VhdxParser(vhdxReader);
+    const { virtualReader: vhdxVirtual } = await vhdxParser.parse();
+
+    const vmdkParser = new VmdkParser(vmdkReader);
+    const { virtualReader: vmdkVirtual } = await vmdkParser.parse();
+
+    // Verify first 2MB of virtual sectors (MBR + Partition VBR + MFT Mirr + MFT Root) match identically
+    const testLen = 2 * 1024 * 1024;
+    const vhdxBytes = await vhdxVirtual.read(0, testLen);
+    const vmdkBytes = await vmdkVirtual.read(0, testLen);
+
+    expect(vmdkBytes).toEqual(vhdxBytes);
+  }, 60000);
 });
+

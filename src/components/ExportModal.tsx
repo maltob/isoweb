@@ -91,17 +91,19 @@ export const ExportModal: React.FC<ExportModalProps> = ({
   const [category, setCategory] = useState<'vhdx' | 'vmdk' | 'iso' | 'raw' | 'zip'>(initialCategory);
 
   // Filesystem selection for VHDX & VMDK & Raw
-  const initialFs = useMemo<'fat32' | 'exfat'>(() => {
+  const initialFs = useMemo<'fat32' | 'exfat' | 'ntfs' | 'xfs'>(() => {
     if (fileOver4GB) return 'exfat';
+    if (activeFmt.includes('xfs')) return 'xfs';
+    if (activeFmt.includes('ntfs')) return 'ntfs';
     if (activeFmt.includes('exfat')) return 'exfat';
     return 'fat32';
   }, [activeFmt, fileOver4GB]);
 
-  const [fsType, setFsType] = useState<'fat32' | 'exfat'>(initialFs);
+  const [fsType, setFsType] = useState<'fat32' | 'exfat' | 'ntfs' | 'xfs'>(initialFs);
 
   // Raw disk format options
-  const [rawSubtype, setRawSubtype] = useState<'floppy' | 'fat16' | 'fat32' | 'exfat'>(
-    fileOver4GB ? 'exfat' : activeFmt === 'fat12' ? 'floppy' : activeFmt === 'fat16' ? 'fat16' : 'fat32'
+  const [rawSubtype, setRawSubtype] = useState<'floppy' | 'fat16' | 'fat32' | 'exfat' | 'ntfs' | 'xfs'>(
+    fileOver4GB ? 'exfat' : activeFmt === 'xfs' ? 'xfs' : activeFmt === 'fat12' ? 'floppy' : activeFmt === 'fat16' ? 'fat16' : activeFmt === 'ntfs' ? 'ntfs' : 'fat32'
   );
 
   // Volume Label
@@ -143,9 +145,23 @@ export const ExportModal: React.FC<ExportModalProps> = ({
     const mbNum = parseInt(capacityMb, 10) || minRequiredMb;
 
     if (category === 'vhdx') {
-      resolvedFormat = fsType === 'exfat' ? 'vhdx-exfat' : 'vhdx-fat32';
+      resolvedFormat =
+        fsType === 'xfs'
+          ? 'vhdx-xfs'
+          : fsType === 'ntfs'
+          ? 'vhdx-ntfs'
+          : fsType === 'exfat'
+          ? 'vhdx-exfat'
+          : 'vhdx-fat32';
     } else if (category === 'vmdk') {
-      resolvedFormat = fsType === 'exfat' ? 'vmdk-exfat' : 'vmdk-fat32';
+      resolvedFormat =
+        fsType === 'xfs'
+          ? 'vmdk-xfs'
+          : fsType === 'ntfs'
+          ? 'vmdk-ntfs'
+          : fsType === 'exfat'
+          ? 'vmdk-exfat'
+          : 'vmdk-fat32';
     } else if (category === 'iso') {
       resolvedFormat = 'iso';
     } else if (category === 'zip') {
@@ -295,7 +311,7 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
                 2. Partition Filesystem
               </label>
-              <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="grid grid-cols-4 gap-2 text-xs">
                 {/* FAT32 */}
                 <button
                   type="button"
@@ -314,9 +330,9 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     {fsType === 'fat32' && !fileOver4GB && <Check className="w-4 h-4 text-sky-400" />}
                   </div>
                   <div className="text-[11px] mt-1 text-slate-400 leading-snug">
-                    Broadest compatibility: DOS, Windows 95–11, Linux, macOS, UEFI bootable partitions.
+                    Broadest compatibility: DOS, Windows, Linux, macOS, UEFI boot.
                   </div>
-                  <div className="text-[10px] text-slate-400/80 mt-1 font-mono">Max file size: 4 GB</div>
+                  <div className="text-[10px] text-slate-400/80 mt-1 font-mono">Max file: 4 GB</div>
                 </button>
 
                 {/* exFAT */}
@@ -341,9 +357,49 @@ export const ExportModal: React.FC<ExportModalProps> = ({
                     {(fsType === 'exfat' || fileOver4GB) && <Check className="w-4 h-4 text-emerald-400" />}
                   </div>
                   <div className="text-[11px] mt-1 text-slate-400 leading-snug">
-                    Modern standard: No 4 GB file limits, supported natively by Windows, macOS, Linux.
+                    Modern standard: No 4 GB limits, Windows, macOS, Linux native.
                   </div>
-                  <div className="text-[10px] text-slate-400/80 mt-1 font-mono">Max file size: 16 EB</div>
+                  <div className="text-[10px] text-slate-400/80 mt-1 font-mono">Max file: 16 EB</div>
+                </button>
+
+                {/* NTFS */}
+                <button
+                  type="button"
+                  onClick={() => setFsType('ntfs')}
+                  className={`p-3 rounded-lg border text-left transition cursor-pointer relative ${
+                    fsType === 'ntfs' && !fileOver4GB
+                      ? 'border-indigo-500 bg-indigo-500/15 text-indigo-200 ring-1 ring-indigo-500/30'
+                      : 'border-slate-800 bg-slate-950 text-slate-400 hover:border-slate-700 hover:text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-bold text-sm">
+                    <span>NTFS</span>
+                    {fsType === 'ntfs' && !fileOver4GB && <Check className="w-4 h-4 text-indigo-400" />}
+                  </div>
+                  <div className="text-[11px] mt-1 text-slate-400 leading-snug">
+                    Windows native: Full MFT, standard info, runs, Hyper-V &amp; VM ready.
+                  </div>
+                  <div className="text-[10px] text-slate-400/80 mt-1 font-mono">Max file: 16 TB</div>
+                </button>
+
+                {/* XFS */}
+                <button
+                  type="button"
+                  onClick={() => setFsType('xfs')}
+                  className={`p-3 rounded-lg border text-left transition cursor-pointer relative ${
+                    fsType === 'xfs' && !fileOver4GB
+                      ? 'border-amber-500 bg-amber-500/15 text-amber-200 ring-1 ring-amber-500/30'
+                      : 'border-slate-800 bg-slate-950 text-slate-400 hover:border-slate-700 hover:text-slate-300'
+                  }`}
+                >
+                  <div className="flex items-center justify-between font-bold text-sm">
+                    <span>XFS</span>
+                    {fsType === 'xfs' && !fileOver4GB && <Check className="w-4 h-4 text-amber-400" />}
+                  </div>
+                  <div className="text-[11px] mt-1 text-slate-400 leading-snug">
+                    Linux native: 64-bit extent journaling (RHEL, Rocky, CentOS, SUSE).
+                  </div>
+                  <div className="text-[10px] text-slate-400/80 mt-1 font-mono">Max file: 8 EB</div>
                 </button>
               </div>
             </div>
@@ -355,12 +411,14 @@ export const ExportModal: React.FC<ExportModalProps> = ({
               <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2">
                 2. Image Subtype
               </label>
-              <div className="grid grid-cols-4 gap-2 text-xs">
+              <div className="grid grid-cols-6 gap-2 text-xs">
                 {[
                   { id: 'floppy', label: '1.44M Floppy', desc: 'FAT12', disabled: totalBytes > 1440 * 1024 },
                   { id: 'fat16', label: 'FAT16 Disk', desc: 'Up to 2GB', disabled: Boolean(fileOver4GB) },
                   { id: 'fat32', label: 'FAT32 Disk', desc: 'Standard MBR', disabled: Boolean(fileOver4GB) },
                   { id: 'exfat', label: 'exFAT Disk', desc: 'Large Files', disabled: false },
+                  { id: 'ntfs', label: 'NTFS Disk', desc: 'Windows MFT', disabled: false },
+                  { id: 'xfs', label: 'XFS Disk', desc: 'Linux Native', disabled: false },
                 ].map((item) => (
                   <button
                     key={item.id}

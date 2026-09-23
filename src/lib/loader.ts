@@ -3,6 +3,9 @@ import { ExFatParser } from './exfat/exfat-parser';
 import { FatParser } from './fat/fat-parser';
 import { IsoParser } from './iso/iso-parser';
 import { ISO_SECTOR_SIZE, ISO_STANDARD_ID } from './iso/iso-types';
+import { NtfsParser } from './ntfs/ntfs-parser';
+import { XfsParser } from './xfs/xfs-parser';
+import { readUint32BE, XFS_SB_MAGIC } from './xfs/xfs-types';
 import { BlobReader, OpfsReader, RandomAccessReader } from './reader';
 import { DiskFormat } from './types';
 import { VirtualFS } from './virtual-fs/virtual-fs';
@@ -20,22 +23,63 @@ export class DiskImageLoader {
   ): Promise<VirtualFS> {
     const format = await this.detectFormat(reader, fileNameHint);
 
-    if (format === 'vhdx-fat32' || format === 'vhdx-exfat') {
+    if (
+      format === 'vhdx-fat32' ||
+      format === 'vhdx-exfat' ||
+      format === 'vhdx-ntfs' ||
+      format === 'vhdx-xfs'
+    ) {
       const parser = new VhdxParser(reader);
       const { vfs } = await parser.parse();
       return vfs;
     }
 
-    if (format === 'vmdk-fat32' || format === 'vmdk-exfat') {
+    if (
+      format === 'vmdk-fat32' ||
+      format === 'vmdk-exfat' ||
+      format === 'vmdk-ntfs' ||
+      format === 'vmdk-xfs'
+    ) {
       const parser = new VmdkParser(reader);
-      const { root, info, virtualReader, fatParser, exfatParser } = await parser.parse();
-      return new VirtualFS(root, info.format, info, virtualReader, fatParser, exfatParser);
+      const { root, info, virtualReader, fatParser, exfatParser, ntfsParser, xfsParser } =
+        await parser.parse();
+      return new VirtualFS(
+        root,
+        info.format,
+        info,
+        virtualReader,
+        fatParser,
+        exfatParser,
+        ntfsParser,
+        xfsParser
+      );
     }
 
     if (format === 'exfat') {
       const parser = new ExFatParser(reader);
       const { root, info } = await parser.parse();
       return new VirtualFS(root, 'exfat', info, reader, undefined, parser);
+    }
+
+    if (format === 'ntfs') {
+      const parser = new NtfsParser(reader);
+      const { root, info } = await parser.parse();
+      return new VirtualFS(root, 'ntfs', info, reader, undefined, undefined, parser);
+    }
+
+    if (format === 'xfs') {
+      const parser = new XfsParser(reader);
+      const { root, info } = await parser.parse();
+      return new VirtualFS(
+        root,
+        'xfs',
+        info,
+        reader,
+        undefined,
+        undefined,
+        undefined,
+        parser
+      );
     }
 
     if (format === 'iso') {
@@ -85,14 +129,22 @@ export class DiskImageLoader {
         return 'vmdk-fat32';
       }
 
-      // 3. Check for exFAT ("EXFAT   " at offset 3)
+      // 3. Check for exFAT, NTFS, or standalone XFS
+      const magic32 = readUint32BE(headerBytes, 0);
+      if (magic32 === XFS_SB_MAGIC || lowerName.endsWith('.xfs')) {
+        return 'xfs';
+      }
+
       const oemName = String.fromCharCode(...headerBytes.subarray(3, 11));
       if (oemName === 'EXFAT   ') {
         return 'exfat';
       }
+      if (oemName === 'NTFS    ') {
+        return 'ntfs';
+      }
     }
 
-    // 3. Check for ISO 9660 signature 'CD001' at sector 16 (0x8000)
+    // 4. Check for ISO 9660 signature 'CD001' at sector 16 (0x8000)
     if (reader.size >= 17 * ISO_SECTOR_SIZE) {
       const pvdHeader = await reader.read(16 * ISO_SECTOR_SIZE, 6);
       const sig = String.fromCharCode(...pvdHeader.subarray(1, 6));
@@ -101,9 +153,12 @@ export class DiskImageLoader {
       }
     }
 
-    // 4. Check extension hints
+    // 5. Check extension hints
     if (lowerName.endsWith('.iso')) {
       return 'iso';
+    }
+    if (lowerName.endsWith('.ntfs')) {
+      return 'ntfs';
     }
 
     // 5. Check for FAT / MBR boot signature 0x55AA at offset 510

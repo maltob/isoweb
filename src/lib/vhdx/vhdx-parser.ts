@@ -3,6 +3,9 @@
 
 import { ExFatParser } from '../exfat/exfat-parser';
 import { FatParser } from '../fat/fat-parser';
+import { NtfsParser } from '../ntfs/ntfs-parser';
+import { XfsParser } from '../xfs/xfs-parser';
+import { readUint32BE, XFS_SB_MAGIC } from '../xfs/xfs-types';
 import { RandomAccessReader } from '../reader';
 import { DiskImageInfo, VNode } from '../types';
 import { VirtualFS } from '../virtual-fs/virtual-fs';
@@ -250,14 +253,31 @@ export class VhdxParser {
 
     // Inspect boot sector of Partition 1
     const p1Boot = await virtualReader.read(partitionStartSector * logicalSectorSize, 512);
-    const isExFat =
-      p1Boot[3] === 0x45 && // 'E'
-      p1Boot[4] === 0x58 && // 'X'
-      p1Boot[5] === 0x46 && // 'F'
-      p1Boot[6] === 0x41 && // 'A'
-      p1Boot[7] === 0x54;   // 'T'
+    const p1Magic = readUint32BE(p1Boot, 0);
+    const oemStr = String.fromCharCode(...p1Boot.subarray(3, 11));
+    const isXfs = p1Magic === XFS_SB_MAGIC;
+    const isExFat = oemStr.startsWith('EXFAT');
+    const isNtfs = oemStr.startsWith('NTFS');
 
-    if (isExFat) {
+    if (isXfs) {
+      const xfsParser = new XfsParser(virtualReader, partitionStartSector);
+      const { root, info } = await xfsParser.parse();
+      info.format = 'vhdx-xfs';
+      info.formatName = `VHDX Virtual Disk - XFS (${Math.round(virtualDiskSize / (1024 * 1024))}MB)`;
+      info.hasMbr = true;
+
+      const vfs = new VirtualFS(root, 'vhdx-xfs', info, virtualReader, undefined, undefined, undefined, xfsParser);
+      return { root, info, vfs, virtualReader };
+    } else if (isNtfs) {
+      const ntfsParser = new NtfsParser(virtualReader, partitionStartSector);
+      const { root, info } = await ntfsParser.parse();
+      info.format = 'vhdx-ntfs';
+      info.formatName = `VHDX Virtual Disk - NTFS (${Math.round(virtualDiskSize / (1024 * 1024))}MB)`;
+      info.hasMbr = true;
+
+      const vfs = new VirtualFS(root, 'vhdx-ntfs', info, virtualReader, undefined, undefined, ntfsParser);
+      return { root, info, vfs, virtualReader };
+    } else if (isExFat) {
       const exfatParser = new ExFatParser(virtualReader, partitionStartSector);
       const { root, info } = await exfatParser.parse();
       info.format = 'vhdx-exfat';

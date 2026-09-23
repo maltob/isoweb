@@ -7,6 +7,7 @@ export interface ImageStreamWriter {
 
 export class FileSystemAccessStreamWriter implements ImageStreamWriter {
   private writer: WritableStreamDefaultWriter<Uint8Array>;
+  bytesWritten = 0;
 
   constructor(writableStream: WritableStream<Uint8Array>) {
     this.writer = writableStream.getWriter();
@@ -14,6 +15,7 @@ export class FileSystemAccessStreamWriter implements ImageStreamWriter {
 
   async write(chunk: Uint8Array): Promise<void> {
     await this.writer.write(chunk);
+    this.bytesWritten += chunk.byteLength;
   }
 
   async close(): Promise<void> {

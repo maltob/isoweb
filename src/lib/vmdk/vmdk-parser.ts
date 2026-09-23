@@ -2,6 +2,9 @@
 // Translates sparse grains to virtual sectors and mounts partitioned FAT32 or exFAT filesystems
 import { ExFatParser } from '../exfat/exfat-parser';
 import { FatParser } from '../fat/fat-parser';
+import { NtfsParser } from '../ntfs/ntfs-parser';
+import { XfsParser } from '../xfs/xfs-parser';
+import { readUint32BE, XFS_SB_MAGIC } from '../xfs/xfs-types';
 import { RandomAccessReader } from '../reader';
 import { DiskImageInfo, VNode } from '../types';
 import {
@@ -70,6 +73,8 @@ export interface VmdkParseResult {
   virtualReader: VmdkVirtualReader;
   fatParser?: FatParser;
   exfatParser?: ExFatParser;
+  ntfsParser?: NtfsParser;
+  xfsParser?: XfsParser;
 }
 
 export class VmdkParser {
@@ -136,11 +141,24 @@ export class VmdkParser {
       if (lba > 0) partitionLba = lba;
     }
 
-    // Check if partition is exFAT (Type 0x07 or "EXFAT   " at partition boot)
+    // Check if partition is XFS, NTFS, or exFAT
     const partBoot = await virtualReader.read(partitionLba * 512, 512);
+    const partMagic = readUint32BE(partBoot, 0);
     const oemName = String.fromCharCode(...partBoot.subarray(3, 11));
 
-    if (oemName === 'EXFAT   ' || partitionType === 0x07) {
+    if (partMagic === XFS_SB_MAGIC || partitionType === 0x83) {
+      const xfsParser = new XfsParser(virtualReader, partitionLba);
+      const res = await xfsParser.parse();
+      res.info.format = 'vmdk-xfs';
+      res.info.formatName = 'VMDK Virtual Disk (XFS Partition)';
+      return { root: res.root, info: res.info, virtualReader, xfsParser };
+    } else if (oemName.startsWith('NTFS')) {
+      const ntfsParser = new NtfsParser(virtualReader, partitionLba);
+      const res = await ntfsParser.parse();
+      res.info.format = 'vmdk-ntfs';
+      res.info.formatName = 'VMDK Virtual Disk (NTFS Partition)';
+      return { root: res.root, info: res.info, virtualReader, ntfsParser };
+    } else if (oemName.startsWith('EXFAT') || partitionType === 0x07) {
       const exfatParser = new ExFatParser(virtualReader, partitionLba);
       const res = await exfatParser.parse();
       res.info.format = 'vmdk-exfat';

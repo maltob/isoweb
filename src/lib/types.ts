@@ -6,10 +6,16 @@ export type DiskFormat =
   | 'fat16'
   | 'fat32'
   | 'exfat'
+  | 'ntfs'
+  | 'xfs'
   | 'vmdk-fat32'
   | 'vmdk-exfat'
+  | 'vmdk-ntfs'
+  | 'vmdk-xfs'
   | 'vhdx-fat32'
-  | 'vhdx-exfat';
+  | 'vhdx-exfat'
+  | 'vhdx-ntfs'
+  | 'vhdx-xfs';
 
 export interface FileMetadata {
   name: string;

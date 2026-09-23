@@ -6,6 +6,10 @@ import { FatParser } from '../fat/fat-parser';
 import { FatType } from '../fat/fat-types';
 import { IsoBuilder } from '../iso/iso-builder';
 import { ISO_SECTOR_SIZE } from '../iso/iso-types';
+import { NtfsBuilder } from '../ntfs/ntfs-builder';
+import { NtfsParser } from '../ntfs/ntfs-parser';
+import { XfsBuilder } from '../xfs/xfs-builder';
+import { XfsParser } from '../xfs/xfs-parser';
 import { RandomAccessReader } from '../reader';
 import { OpfsManager } from '../storage/opfs';
 import { BlobAccumulatorWriter, FileSystemAccessStreamWriter, ImageStreamWriter } from '../storage/stream-writer';
@@ -21,6 +25,8 @@ export class VirtualFS {
   private sourceReader?: RandomAccessReader;
   private sourceFatParser?: FatParser;
   private sourceExFatParser?: ExFatParser;
+  private sourceNtfsParser?: NtfsParser;
+  private sourceXfsParser?: XfsParser;
 
   constructor(
     root: VNode,
@@ -28,7 +34,9 @@ export class VirtualFS {
     imageInfo: DiskImageInfo,
     sourceReader?: RandomAccessReader,
     sourceFatParser?: FatParser,
-    sourceExFatParser?: ExFatParser
+    sourceExFatParser?: ExFatParser,
+    sourceNtfsParser?: NtfsParser,
+    sourceXfsParser?: XfsParser
   ) {
     this.root = root;
     this.format = format;
@@ -36,6 +44,8 @@ export class VirtualFS {
     this.sourceReader = sourceReader;
     this.sourceFatParser = sourceFatParser;
     this.sourceExFatParser = sourceExFatParser;
+    this.sourceNtfsParser = sourceNtfsParser;
+    this.sourceXfsParser = sourceXfsParser;
   }
 
   getRoot(): VNode {
@@ -106,6 +116,14 @@ export class VirtualFS {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
       formatName = `exFAT Disk Image (${mb}MB)`;
+    } else if (format === 'ntfs') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `NTFS Disk Image (${mb}MB)`;
+    } else if (format === 'xfs') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `XFS Disk Image (${mb}MB)`;
     } else if (format === 'vmdk-fat32') {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
@@ -114,6 +132,14 @@ export class VirtualFS {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
       formatName = `VMDK Virtual Disk - exFAT (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vmdk-ntfs') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VMDK Virtual Disk - NTFS (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vmdk-xfs') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VMDK Virtual Disk - XFS (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
     } else if (format === 'vhdx-fat32') {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 1024;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
@@ -122,12 +148,20 @@ export class VirtualFS {
       const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
       totalSectors = Math.floor((mb * 1024 * 1024) / 512);
       formatName = `VHDX Virtual Disk - exFAT (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vhdx-ntfs') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VHDX Virtual Disk - NTFS (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
+    } else if (format === 'vhdx-xfs') {
+      const mb = sizePreset ? parseInt(sizePreset, 10) : 2048;
+      totalSectors = Math.floor((mb * 1024 * 1024) / 512);
+      formatName = `VHDX Virtual Disk - XFS (${mb >= 1024 ? `${mb / 1024}GB` : `${mb}MB`})`;
     }
 
     const isMbrFormat =
       hasMbr !== undefined
         ? hasMbr
-        : format === 'fat16' || format === 'fat32' || format.startsWith('vmdk') || format.startsWith('vhdx');
+        : format === 'fat16' || format === 'fat32' || format === 'exfat' || format === 'ntfs' || format.startsWith('vmdk') || format.startsWith('vhdx');
 
     const info: DiskImageInfo = {
       format,
@@ -319,13 +353,22 @@ export class VirtualFS {
       return await this.sourceExFatParser.readFileData(node);
     }
 
+    // From NTFS source
+    // From NTFS source
+    if (this.sourceNtfsParser) {
+      const bytes = await this.sourceNtfsParser.readFileData(node);
+      if (bytes.length > 0 || node.size === 0) return bytes;
+    }
+
+    // From XFS source
+    if (this.sourceXfsParser) {
+      const bytes = await this.sourceXfsParser.readFileData(node);
+      if (bytes.length > 0 || node.size === 0) return bytes;
+    }
+
     return new Uint8Array(0);
   }
 
-  /**
-   * Builds the disk image directly into a streaming writer (OPFS, Disk, or Memory)
-   * Uses almost zero RAM even for multi-gigabyte disk images!
-   */
   /**
    * Dynamically changes the active format of the virtual filesystem
    */
@@ -338,19 +381,43 @@ export class VirtualFS {
       this.imageInfo.hasJoliet = true;
       this.imageInfo.hasMbr = false;
     } else if (format.startsWith('vmdk')) {
-      const isExfat = format === 'vmdk-exfat';
-      this.imageInfo.formatName = `VMDK Virtual Disk - ${isExfat ? 'exFAT' : 'FAT32'}`;
+      const fsSub =
+        format === 'vmdk-exfat'
+          ? 'exFAT'
+          : format === 'vmdk-ntfs'
+          ? 'NTFS'
+          : format === 'vmdk-xfs'
+          ? 'XFS'
+          : 'FAT32';
+      this.imageInfo.formatName = `VMDK Virtual Disk - ${fsSub}`;
       this.imageInfo.sectorSize = 512;
       this.imageInfo.hasJoliet = false;
       this.imageInfo.hasMbr = true;
     } else if (format.startsWith('vhdx')) {
-      const isExfat = format === 'vhdx-exfat';
-      this.imageInfo.formatName = `VHDX Virtual Disk - ${isExfat ? 'exFAT' : 'FAT32'}`;
+      const fsSub =
+        format === 'vhdx-exfat'
+          ? 'exFAT'
+          : format === 'vhdx-ntfs'
+          ? 'NTFS'
+          : format === 'vhdx-xfs'
+          ? 'XFS'
+          : 'FAT32';
+      this.imageInfo.formatName = `VHDX Virtual Disk - ${fsSub}`;
       this.imageInfo.sectorSize = 512;
       this.imageInfo.hasJoliet = false;
       this.imageInfo.hasMbr = true;
     } else if (format === 'exfat') {
       this.imageInfo.formatName = 'exFAT Disk Image';
+      this.imageInfo.sectorSize = 512;
+      this.imageInfo.hasJoliet = false;
+      this.imageInfo.hasMbr = true;
+    } else if (format === 'ntfs') {
+      this.imageInfo.formatName = 'NTFS Disk Image';
+      this.imageInfo.sectorSize = 512;
+      this.imageInfo.hasJoliet = false;
+      this.imageInfo.hasMbr = true;
+    } else if (format === 'xfs') {
+      this.imageInfo.formatName = 'XFS Disk Image';
       this.imageInfo.sectorSize = 512;
       this.imageInfo.hasJoliet = false;
       this.imageInfo.hasMbr = true;
@@ -379,7 +446,7 @@ export class VirtualFS {
     const label = opts.volumeLabel || this.imageInfo.volumeLabel;
     const userCapacitySectors = opts.capacityMb ? Math.floor((opts.capacityMb * 1024 * 1024) / 512) : undefined;
 
-    if (fmt === 'vhdx-fat32' || fmt === 'vhdx-exfat') {
+    if (fmt === 'vhdx-fat32' || fmt === 'vhdx-exfat' || fmt === 'vhdx-ntfs' || fmt === 'vhdx-xfs') {
       const minCapacity = Math.max(
         2097152, // 1 GB minimum default
         Math.ceil((this.root.size * 1.5) / 512) + 4096
@@ -391,12 +458,12 @@ export class VirtualFS {
         : minCapacity;
 
       const builder = new VhdxBuilder(this.root, {
-        fsType: fmt === 'vhdx-fat32' ? 'fat32' : 'exfat',
+        fsType: fmt === 'vhdx-fat32' ? 'fat32' : fmt === 'vhdx-exfat' ? 'exfat' : fmt === 'vhdx-ntfs' ? 'ntfs' : 'xfs',
         volumeLabel: label || 'VHDX_DISK',
         capacitySectors,
       });
       await builder.buildToStream(writer, onProgress);
-    } else if (fmt === 'vmdk-fat32' || fmt === 'vmdk-exfat') {
+    } else if (fmt === 'vmdk-fat32' || fmt === 'vmdk-exfat' || fmt === 'vmdk-ntfs' || fmt === 'vmdk-xfs') {
       const minCapacity = Math.max(
         2097152, // 1 GB minimum default
         Math.ceil((this.root.size * 1.5) / 512) + 4096
@@ -409,15 +476,23 @@ export class VirtualFS {
 
       const vmdkDiskName = `${(label || 'vmdk_disk').toLowerCase().replace(/[^a-z0-9_-]/g, '_')}.vmdk`;
       const builder = new VmdkBuilder(this.root, {
-        fsType: fmt === 'vmdk-fat32' ? 'fat32' : 'exfat',
+        fsType: fmt === 'vmdk-fat32' ? 'fat32' : fmt === 'vmdk-exfat' ? 'exfat' : fmt === 'vmdk-ntfs' ? 'ntfs' : 'xfs',
         volumeLabel: label || 'VMDK_DISK',
         capacitySectors,
         diskName: vmdkDiskName,
       });
       await builder.buildToStream(writer, onProgress);
+    } else if (fmt === 'xfs') {
+      const sectors = userCapacitySectors || this.imageInfo.totalSectors || Math.max(2097152, Math.ceil((this.root.size * 1.5) / 512));
+      const builder = new XfsBuilder(this.root, { volumeLabel: label || 'XFS_DISK', partitionSectors: sectors });
+      await builder.buildToStream(writer, onProgress);
     } else if (fmt === 'exfat') {
       const sectors = userCapacitySectors || this.imageInfo.totalSectors || Math.max(2097152, Math.ceil((this.root.size * 1.5) / 512));
       const builder = new ExFatBuilder(this.root, label || 'EXFAT', sectors);
+      await builder.buildToStream(writer, onProgress);
+    } else if (fmt === 'ntfs') {
+      const sectors = userCapacitySectors || this.imageInfo.totalSectors || Math.max(2097152, Math.ceil((this.root.size * 1.5) / 512));
+      const builder = new NtfsBuilder(this.root, { volumeLabel: label || 'NTFS_DISK', partitionSectors: sectors });
       await builder.buildToStream(writer, onProgress);
     } else if (fmt === 'iso') {
       const builder = new IsoBuilder(
@@ -501,6 +576,9 @@ export class VirtualFS {
     const accessWriter = new FileSystemAccessStreamWriter(writable);
     try {
       await this.buildToStream(accessWriter, onProgress, targetFormatOrOptions);
+      if (accessWriter.bytesWritten === 0) {
+        throw new Error('The disk image builder completed without writing any data.');
+      }
     } finally {
       await accessWriter.close();
     }
