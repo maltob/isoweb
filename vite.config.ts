@@ -4,7 +4,7 @@ import tailwindcss from '@tailwindcss/vite';
 
 // https://vite.dev/config/
 export default defineConfig({
-  base: './',
+  base: process.env.BASE_URL || (process.env.NODE_ENV === 'production' ? '/isoweb/' : '/'),
   plugins: [react(), tailwindcss()],
   server: {
     port: 3000,

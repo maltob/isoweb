@@ -29,15 +29,17 @@ import {
   XFS_FIBT_CRC_MAGIC,
   XFS_IBT_CRC_MAGIC,
   XFS_SB_FEAT_INCOMPAT_FTYPE,
+  XFS_SB_FEAT_RO_COMPAT_FINOBT,
   XFS_SB_MAGIC,
-  XFS_SB_VERSION_5,
-  XFS_SB_VERSION_MOREBITSBIT,
+  XFS_SB_V5_VERS_FLAGS,
   XFS_SB_VERSION2_ATTR2BIT,
   XFS_SB_VERSION2_CRCBIT,
   XFS_SB_VERSION2_FTYPE,
   XFS_SB_VERSION2_LAZYSBCOUNTBIT,
   XFS_SB_VERSION2_PROJID32BIT,
   XFS_SECTOR_SIZE,
+  XFS_MIN_LOG_BLOCKS,
+  NULLAGINO,
 } from './xfs-types';
 
 interface FileAllocation {
@@ -56,7 +58,6 @@ export class XfsBuilder implements IFileSystemBuilder {
   private root: VNode;
   private volumeLabel: string;
   private totalSectors: number;
-  private partitionStartSector: number;
   private padToCapacity: boolean;
   private uuid: Uint8Array;
 
@@ -64,7 +65,6 @@ export class XfsBuilder implements IFileSystemBuilder {
     this.root = root;
     this.volumeLabel = (options.volumeLabel || 'XFS_DISK').slice(0, 12);
     this.totalSectors = Math.max(32768, options.partitionSectors); // Min 16MB
-    this.partitionStartSector = options.partitionStartSector ?? 0;
     this.padToCapacity = options.padToCapacity ?? false;
 
     // Generate deterministic or random UUID (16 bytes)
@@ -84,7 +84,6 @@ export class XfsBuilder implements IFileSystemBuilder {
 
     const blockSize = XFS_DEFAULT_BLOCK_SIZE; // 4096
     const inodeSize = XFS_DEFAULT_INODE_SIZE; // 512
-    const inopblock = blockSize / inodeSize; // 8
     const inopblog = 3; // log2(8)
     const blocklog = 12; // log2(4096)
     const sectlog = 9; // log2(512)
@@ -106,30 +105,47 @@ export class XfsBuilder implements IFileSystemBuilder {
     // Block 5: cntbt root
     // Block 6: inobt root
     // Block 7: finobt root
-    // Block 8..15: Reserved / Alignment
-    // Block 16..23: Inode chunk (64 inodes = 8 blocks of 4096 bytes)
-    // Root inode: First inode of AG 0 inode chunk
-    // Inode number = (agno << (agblklog + inopblog)) | (agbno << inopblog) | offset_in_block
-    // For AG 0, block 16: rootIno = (0 << ...) | (16 << 3) | 0 = 128
-    const inodeChunkStartBlock = 16;
+    // In AG 0 with internal journal log:
+    // Standard XFS mkfs places the internal log before the inode chunks in AG 0.
+    // Block 8..519: Internal journal log (512 blocks = 2MB at 4KB)
+    // Blocks 520..523: Alignment padding to align first inode chunk to 4 blocks (inoalignmt)
+    // Block 524..531: First inode chunk (64 inodes = 8 blocks of 4096 bytes, aligned to 4 blocks)
+    // Root inode: First inode of AG 0 inode chunk: 524 << 3 = 4192
+    // Realtime bitmap inode (sb_rbmino): 4192 + 1 = 4193
+    // Realtime summary inode (sb_rsumino): 4192 + 2 = 4194
+    // User files/subdirs: start at 4192 + 3 = 4195
+    // This matches standard Linux kernel xfs_ialloc_calc_rootino and xfs_repair expectations.
+    const logStartBlock = 8;
+    const logBlocks = agBlocks >= 1024 ? XFS_MIN_LOG_BLOCKS : Math.max(64, Math.floor(agBlocks / 4));
+    // In AG 0:
+    // bnobt(1) + cntbt(1) + inobt(1) + agfl_min_freelist(4) + finobt(1) = 8 blocks after block 0 (block 8)
+    // logStartBlock + 1 (finobt) + logBlocks = 9 + 512 = 521
+    // roundup(521, inoalignmt=4) = 524
+    const inodeChunkStartBlock = Math.ceil((logStartBlock + 1 + logBlocks) / 4) * 4; // 524
     const inodeChunkBlocks = 8; // 64 inodes * 512 bytes = 32,768 bytes = 8 blocks
-    const rootIno = (inodeChunkStartBlock << inopblog); // 128
+    const rootIno = inodeChunkStartBlock << inopblog; // 4192
 
     onProgress?.(0.15, 'Preparing directory tree and file allocations...');
 
     // Traverse directory tree and assign inodes & data blocks
-    let nextInoOffset = 0; // offset within the 64-inode chunk
-    let nextDataBlock = inodeChunkStartBlock + inodeChunkBlocks; // starts at block 24
+    // Inode 4192 is the root directory '/' (offset 0).
+    // Inodes 4193 (offset 1) and 4194 (offset 2) are reserved for sb_rbmino and sb_rsumino.
+    // User files and subdirectories start at offset 3 (4195).
+    let nextChildInoOffset = 3;
+    let nextDataBlock = inodeChunkStartBlock + inodeChunkBlocks; // data blocks start after inode chunk
 
     const allocs: FileAllocation[] = [];
     const blockDataMap = new Map<number, Uint8Array>();
 
+    // In mkfs.xfs, the internal log is cleanly zeroed (all zeros).
+    // An empty/clean log has head block 0 tail block 0, avoiding unneeded log replay errors.
+
     const assignAllocations = async (
       node: VNode,
-      parentIno: number
+      parentIno: number,
+      isRoot: boolean = false
     ): Promise<FileAllocation> => {
-      const currentIno = rootIno + nextInoOffset;
-      nextInoOffset++;
+      const currentIno = isRoot ? rootIno : rootIno + nextChildInoOffset++;
 
       const isDir = node.isDirectory;
       const alloc: FileAllocation = {
@@ -144,7 +160,7 @@ export class XfsBuilder implements IFileSystemBuilder {
 
       if (isDir) {
         for (const child of node.children || []) {
-          const childAlloc = await assignAllocations(child, currentIno);
+          const childAlloc = await assignAllocations(child, currentIno, false);
           alloc.children!.push(childAlloc);
         }
       } else {
@@ -179,17 +195,17 @@ export class XfsBuilder implements IFileSystemBuilder {
       return alloc;
     };
 
-    const rootAlloc = await assignAllocations(this.root, rootIno);
+    await assignAllocations(this.root, rootIno, true);
 
     // Build directory blocks for directories that exceed shortform size
     for (const alloc of allocs) {
       if (!alloc.isDir) continue;
 
-      // Estimate shortform size: 10 bytes header + sum(3 + name.length + 8 + 1)
+      // Estimate shortform size: 10 bytes header + sum(3 + name.length + 1 + 8)
       let sfSize = 10;
       for (const child of alloc.children || []) {
         const nameBytes = new TextEncoder().encode(child.node.name);
-        sfSize += 3 + nameBytes.length + 8 + 1; // namelen(1) + offset(2) + name + ino(8) + ftype(1)
+        sfSize += 3 + nameBytes.length + 1 + 8; // namelen(1) + offset(2) + name + ftype(1) + ino(8)
       }
 
       // Inode literal area in v5 inode is 512 - 176 = 336 bytes
@@ -214,15 +230,33 @@ export class XfsBuilder implements IFileSystemBuilder {
     onProgress?.(0.35, 'Writing Superblock, AG Headers and Inode table...');
 
     // Create the inode table buffer for the 64-inode chunk (8 blocks = 32768 bytes)
+    // Pre-initialize all 64 inodes as valid free inodes so every inode passes xfs_inode_buf_verify
     const inodeTableBytes = new Uint8Array(inodeChunkBlocks * blockSize);
+    for (let i = 0; i < 64; i++) {
+      const freeInodeBuf = this.createFreeInode(rootIno + i, inodeSize);
+      inodeTableBytes.set(freeInodeBuf, i * inodeSize);
+    }
+
+    // Overwrite allocated inodes with actual file/dir metadata
+    // Also track which inodes are allocated in the 64-inode chunk
+    let freeMask = 0xffffffffffffffffn;
     for (const alloc of allocs) {
       const inoOffset = alloc.ino - rootIno;
       if (inoOffset >= 64) {
         throw new Error('Directory tree exceeds initial 64 inode chunk capacity in XFS builder');
       }
+      freeMask &= ~(1n << BigInt(inoOffset));
       const inodeByteOffset = inoOffset * inodeSize;
       const inodeBuf = this.createInode(alloc, inodeSize);
       inodeTableBytes.set(inodeBuf, inodeByteOffset);
+    }
+
+    // Number of free inodes in the 64-inode chunk
+    let freeCount = 0;
+    for (let i = 0; i < 64; i++) {
+      if ((freeMask & (1n << BigInt(i))) !== 0n) {
+        freeCount++;
+      }
     }
 
     for (let b = 0; b < inodeChunkBlocks; b++) {
@@ -246,15 +280,18 @@ export class XfsBuilder implements IFileSystemBuilder {
       blocklog,
       inodelog,
       inopblog,
-      agblklog
+      agblklog,
+      logStartBlock,
+      logBlocks,
+      freeCount
     );
     const agf0 = this.createAgf(0, agBlocks, ag0FreeBlocks, ag0UsedBlocks);
-    const agi0 = this.createAgi(0, agBlocks, allocs.length, 64 - allocs.length, rootIno);
+    const agi0 = this.createAgi(0, agBlocks, 64, freeCount, rootIno);
     const agfl0 = this.createAgfl(0);
     const bnobt0 = this.createBnobt(0, ag0UsedBlocks, ag0FreeBlocks);
     const cntbt0 = this.createCntbt(0, ag0UsedBlocks, ag0FreeBlocks);
-    const inobt0 = this.createInobt(0, 0, allocs.length);
-    const finobt0 = this.createFinobt(0, 0, allocs.length);
+    const inobt0 = this.createInobt(0, rootIno, freeCount, freeMask);
+    const finobt0 = this.createFinobt(0, rootIno, freeCount, freeMask);
 
     blockDataMap.set(0, sb0);
     blockDataMap.set(1, agf0);
@@ -266,52 +303,83 @@ export class XfsBuilder implements IFileSystemBuilder {
     blockDataMap.set(7, finobt0);
 
     // Initialize secondary AGs if agCount > 1
-    for (let ag = 1; ag < agCount; ag++) {
-      const agStartBlock = ag * agBlocks;
-      const sbAg = this.createSuperblock(
-        ag,
-        totalBlocks,
-        agBlocks,
-        agCount,
-        rootIno,
-        blockSize,
-        sectlog,
-        blocklog,
-        inodelog,
-        inopblog,
-        agblklog
-      );
-      const agFreeBlocks = agBlocks - 8;
-      const agfAg = this.createAgf(ag, agBlocks, agFreeBlocks, 8);
-      const agiAg = this.createAgi(ag, agBlocks, 0, 0, 0);
-      const agflAg = this.createAgfl(ag);
-      const bnobtAg = this.createBnobt(ag, 8, agFreeBlocks);
-      const cntbtAg = this.createCntbt(ag, 8, agFreeBlocks);
-      const inobtAg = this.createInobt(ag, 0, 0);
-      const finobtAg = this.createFinobt(ag, 0, 0);
+    if (agCount > 1) {
+      for (let ag = 1; ag < agCount; ag++) {
+        const agStartBlock = ag * agBlocks;
+        const sbAg = this.createSuperblock(
+          ag,
+          totalBlocks,
+          agBlocks,
+          agCount,
+          rootIno,
+          blockSize,
+          sectlog,
+          blocklog,
+          inodelog,
+          inopblog,
+          agblklog,
+          logStartBlock,
+          logBlocks
+        );
+        const agFreeBlocks = agBlocks - 8;
+        const agfAg = this.createAgf(ag, agBlocks, agFreeBlocks, 8);
+        const agiAg = this.createAgi(ag, agBlocks, 0, 0, 0);
+        const agflAg = this.createAgfl(ag);
+        const bnobtAg = this.createBnobt(ag, 8, agFreeBlocks);
+        const cntbtAg = this.createCntbt(ag, 8, agFreeBlocks);
+        const inobtAg = this.createInobt(ag, 0, 0);
+        const finobtAg = this.createFinobt(ag, 0, 0);
 
-      blockDataMap.set(agStartBlock + 0, sbAg);
-      blockDataMap.set(agStartBlock + 1, agfAg);
-      blockDataMap.set(agStartBlock + 2, agiAg);
-      blockDataMap.set(agStartBlock + 3, agflAg);
-      blockDataMap.set(agStartBlock + 4, bnobtAg);
-      blockDataMap.set(agStartBlock + 5, cntbtAg);
-      blockDataMap.set(agStartBlock + 6, inobtAg);
-      blockDataMap.set(agStartBlock + 7, finobtAg);
+        blockDataMap.set(agStartBlock + 0, sbAg);
+        blockDataMap.set(agStartBlock + 1, agfAg);
+        blockDataMap.set(agStartBlock + 2, agiAg);
+        blockDataMap.set(agStartBlock + 3, agflAg);
+        blockDataMap.set(agStartBlock + 4, bnobtAg);
+        blockDataMap.set(agStartBlock + 5, cntbtAg);
+        blockDataMap.set(agStartBlock + 6, inobtAg);
+        blockDataMap.set(agStartBlock + 7, finobtAg);
+      }
     }
 
-    // Stream blocks sequentially
+    // Stream blocks sequentially with chunked zero writes for fast streaming
     onProgress?.(0.6, 'Streaming XFS filesystem blocks...');
     const highestBlock = this.padToCapacity
       ? totalBlocks - 1
       : Math.max(...Array.from(blockDataMap.keys()));
 
-    const zeroBlock = new Uint8Array(blockSize);
-    for (let blkIdx = 0; blkIdx <= highestBlock; blkIdx++) {
-      const data = blockDataMap.get(blkIdx) || zeroBlock;
-      await writer.write(data);
+    // Pre-allocate a 1MB zero buffer (256 blocks) for streaming gaps rapidly
+    const ZERO_CHUNK_BLOCKS = 256;
+    const zeroChunk = new Uint8Array(ZERO_CHUNK_BLOCKS * blockSize);
+    const singleZeroBlock = new Uint8Array(blockSize);
 
-      if (blkIdx % 256 === 0) {
+    let blkIdx = 0;
+    while (blkIdx <= highestBlock) {
+      if (blockDataMap.has(blkIdx)) {
+        await writer.write(blockDataMap.get(blkIdx)!);
+        blkIdx++;
+      } else {
+        // Find how many consecutive zero blocks we have up to next allocated block or highestBlock
+        let runEnd = blkIdx;
+        while (runEnd <= highestBlock && !blockDataMap.has(runEnd)) {
+          runEnd++;
+        }
+        let zeroCount = runEnd - blkIdx;
+
+        // Write in 1MB chunks
+        while (zeroCount >= ZERO_CHUNK_BLOCKS) {
+          await writer.write(zeroChunk);
+          blkIdx += ZERO_CHUNK_BLOCKS;
+          zeroCount -= ZERO_CHUNK_BLOCKS;
+        }
+        // Write any remaining single zero blocks
+        while (zeroCount > 0) {
+          await writer.write(singleZeroBlock);
+          blkIdx++;
+          zeroCount--;
+        }
+      }
+
+      if (blkIdx % 1024 === 0) {
         onProgress?.(0.6 + (blkIdx / highestBlock) * 0.38, 'Streaming XFS partition blocks...');
       }
     }
@@ -320,7 +388,7 @@ export class XfsBuilder implements IFileSystemBuilder {
   }
 
   private createSuperblock(
-    agno: number,
+    _agno: number,
     dblocks: number,
     agblocks: number,
     agcount: number,
@@ -330,7 +398,10 @@ export class XfsBuilder implements IFileSystemBuilder {
     blocklog: number,
     inodelog: number,
     inopblog: number,
-    agblklog: number
+    agblklog: number,
+    logstart: number = 0,
+    logblocks: number = 0,
+    ifree: number = 63
   ): Uint8Array {
     const buf = new Uint8Array(blocksize);
 
@@ -340,19 +411,18 @@ export class XfsBuilder implements IFileSystemBuilder {
     writeUint64BE(buf, 16, 0); // rblocks
     writeUint64BE(buf, 24, 0); // rextents
     buf.set(this.uuid, 32); // uuid (16 bytes)
-    writeUint64BE(buf, 48, 0); // logstart (0 = internal/unallocated for simple mkfs)
-    writeUint64BE(buf, 56, rootino); // rootino
-    writeUint64BE(buf, 64, 0); // rbmino
-    writeUint64BE(buf, 72, 0); // rsumino
-    writeUint32BE(buf, 80, 0); // rextsize
+    writeUint64BE(buf, 48, logstart); // logstart (filesystem block of internal journal)
+    writeUint64BE(buf, 56, rootino); // rootino (4192)
+    writeUint64BE(buf, 64, rootino + 1); // rbmino (4193)
+    writeUint64BE(buf, 72, rootino + 2); // rsumino (4194)
+    writeUint32BE(buf, 80, 1); // rextsize (default 1 block, required for rt geometry check)
     writeUint32BE(buf, 84, agblocks);
     writeUint32BE(buf, 88, agcount);
     writeUint32BE(buf, 92, 0); // rbmblocks
-    writeUint32BE(buf, 96, 0); // logblocks
+    writeUint32BE(buf, 96, logblocks); // logblocks
 
-    // sb_versionnum: v5 + morebits
-    const versionnum = XFS_SB_VERSION_5 | XFS_SB_VERSION_MOREBITSBIT;
-    writeUint16BE(buf, 100, versionnum);
+    // sb_versionnum: v5 (includes mandatory v4 flags NLINK, ALIGN, LOGV2, EXTFLG, DIRV2, MOREBITS)
+    writeUint16BE(buf, 100, XFS_SB_V5_VERS_FLAGS);
     writeUint16BE(buf, 102, XFS_SECTOR_SIZE); // sectsize
     writeUint16BE(buf, 104, XFS_DEFAULT_INODE_SIZE); // inodesize
     writeUint16BE(buf, 106, blocksize / XFS_DEFAULT_INODE_SIZE); // inopblock (8)
@@ -371,7 +441,7 @@ export class XfsBuilder implements IFileSystemBuilder {
     buf[127] = 25; // imax_pct (25%)
 
     writeUint64BE(buf, 128, 64); // icount (64 inodes allocated)
-    writeUint64BE(buf, 136, 63); // ifree
+    writeUint64BE(buf, 136, ifree); // ifree
     writeUint64BE(buf, 144, dblocks - 32); // fdblocks
     writeUint64BE(buf, 152, 0); // frextents
 
@@ -380,13 +450,14 @@ export class XfsBuilder implements IFileSystemBuilder {
     writeUint16BE(buf, 176, 0); // qflags
     buf[178] = 0; // flags
     buf[179] = 0; // shared_vn
-    writeUint32BE(buf, 180, 0); // inoalignmt
+    const inoalign = (8192 * (XFS_DEFAULT_INODE_SIZE / 256)) >> blocklog; // 4 fs blocks for 512B inodes at 4KB blocks (scaled cluster size 16KB)
+    writeUint32BE(buf, 180, inoalign); // inoalignmt
     writeUint32BE(buf, 184, 0); // unit
     writeUint32BE(buf, 188, 0); // width
     buf[192] = 0; // dirblklog
     buf[193] = sectlog; // logsectlog
     writeUint16BE(buf, 194, XFS_SECTOR_SIZE); // logsectsize
-    writeUint32BE(buf, 196, 0); // logsunit
+    writeUint32BE(buf, 196, 1); // logsunit (1 byte for v2 log without stripe alignment)
 
     // sb_features2: CRC, FTYPE, ATTR2, PROJID32, LAZYSBCOUNT
     const feat2 =
@@ -400,7 +471,7 @@ export class XfsBuilder implements IFileSystemBuilder {
 
     // v5 features
     writeUint32BE(buf, 208, 0); // features_compat
-    writeUint32BE(buf, 212, 0); // features_ro_compat
+    writeUint32BE(buf, 212, XFS_SB_FEAT_RO_COMPAT_FINOBT); // features_ro_compat (finobt)
     writeUint32BE(buf, 216, XFS_SB_FEAT_INCOMPAT_FTYPE); // features_incompat (ftype)
     writeUint32BE(buf, 220, 0); // features_log_incompat
 
@@ -422,7 +493,7 @@ export class XfsBuilder implements IFileSystemBuilder {
     agno: number,
     agblocks: number,
     freeblocks: number,
-    usedblocks: number
+    _usedblocks: number
   ): Uint8Array {
     const buf = new Uint8Array(XFS_DEFAULT_BLOCK_SIZE);
     writeUint32BE(buf, 0, XFS_AGF_MAGIC);
@@ -555,7 +626,12 @@ export class XfsBuilder implements IFileSystemBuilder {
     return buf;
   }
 
-  private createInobt(agno: number, startIno: number, count: number): Uint8Array {
+  private createInobt(
+    agno: number,
+    startIno: number,
+    freeCount: number,
+    freeMask: bigint = 0n
+  ): Uint8Array {
     const buf = new Uint8Array(XFS_DEFAULT_BLOCK_SIZE);
     writeUint32BE(buf, 0, XFS_IBT_CRC_MAGIC);
     writeUint16BE(buf, 4, 0); // level = 0
@@ -570,10 +646,7 @@ export class XfsBuilder implements IFileSystemBuilder {
 
     // Inode record 0: startino(4), freecount(4), free(8 bytes bitmap)
     writeUint32BE(buf, 56, startIno);
-    writeUint32BE(buf, 60, 64 - count); // freecount
-    // Bitmap: 1 bit per inode, 1 = free, 0 = allocated
-    // For allocated inodes 0..count-1, bits are 0. Remaining bits are 1.
-    const freeMask = count >= 64 ? 0n : ~((1n << BigInt(count)) - 1n);
+    writeUint32BE(buf, 60, freeCount); // freecount
     writeUint64BE(buf, 64, freeMask);
 
     const crc = computeCrc32c(buf, 0, XFS_DEFAULT_BLOCK_SIZE);
@@ -582,7 +655,12 @@ export class XfsBuilder implements IFileSystemBuilder {
     return buf;
   }
 
-  private createFinobt(agno: number, startIno: number, count: number): Uint8Array {
+  private createFinobt(
+    agno: number,
+    startIno: number,
+    freeCount: number,
+    freeMask: bigint = 0n
+  ): Uint8Array {
     const buf = new Uint8Array(XFS_DEFAULT_BLOCK_SIZE);
     writeUint32BE(buf, 0, XFS_FIBT_CRC_MAGIC);
     writeUint16BE(buf, 4, 0);
@@ -596,8 +674,7 @@ export class XfsBuilder implements IFileSystemBuilder {
     writeUint32LE(buf, 52, 0);
 
     writeUint32BE(buf, 56, startIno);
-    writeUint32BE(buf, 60, 64 - count);
-    const freeMask = count >= 64 ? 0n : ~((1n << BigInt(count)) - 1n);
+    writeUint32BE(buf, 60, freeCount);
     writeUint64BE(buf, 64, freeMask);
 
     const crc = computeCrc32c(buf, 0, XFS_DEFAULT_BLOCK_SIZE);
@@ -652,14 +729,20 @@ export class XfsBuilder implements IFileSystemBuilder {
     writeUint32BE(buf, 84, 0); // dmevmask
     writeUint16BE(buf, 88, 0); // dmstate
     writeUint16BE(buf, 90, 0); // flags
+    writeUint32BE(buf, 92, 0); // di_gen
+    writeUint32BE(buf, 96, NULLAGINO); // di_next_unlinked (MUST be NULLAGINO / 0xffffffff)
 
     // v5 Inode extensions (offset 100..176)
     writeUint32LE(buf, 100, 0); // di_crc (offset 100, LE)
     writeUint64BE(buf, 104, 1); // changecount
     writeUint64BE(buf, 112, 1); // lsn
     writeUint64BE(buf, 120, 0); // flags2
-    buf.set(this.uuid, 144); // ino uuid
-    writeUint64BE(buf, 160, alloc.ino); // di_ino (absolute inode number)
+    writeUint32BE(buf, 128, 0); // cowextsize
+    // offset 132..143: di_pad2 (12 bytes zero)
+    writeUint32BE(buf, 144, timeSec); // di_crtime sec
+    writeUint32BE(buf, 148, 0); // di_crtime nsec
+    writeUint64BE(buf, 152, alloc.ino); // di_ino (absolute inode number)
+    buf.set(this.uuid, 160); // di_uuid (meta uuid, 16 bytes)
 
     // Data Fork starts at byte 176
     const dataFork = buf.subarray(176);
@@ -679,12 +762,16 @@ export class XfsBuilder implements IFileSystemBuilder {
           dataFork[sfOffset] = nameBytes.length; // namelen
           writeUint16BE(dataFork, sfOffset + 1, entryTag); // offset
           dataFork.set(nameBytes, sfOffset + 3); // name
-          writeUint64BE(dataFork, sfOffset + 3 + nameBytes.length, child.ino); // inumber (8 bytes)
-          dataFork[sfOffset + 3 + nameBytes.length + 8] = child.isDir
+          dataFork[sfOffset + 3 + nameBytes.length] = child.isDir
             ? XFS_DIR3_FT_DIR
-            : XFS_DIR3_FT_REG_FILE; // ftype
+            : XFS_DIR3_FT_REG_FILE; // ftype (1 byte, immediately after name)
+          writeUint64BE(
+            dataFork,
+            sfOffset + 3 + nameBytes.length + 1,
+            child.ino
+          ); // inumber (8 bytes, immediately follows ftype)
 
-          sfOffset += 3 + nameBytes.length + 8 + 1;
+          sfOffset += 3 + nameBytes.length + 1 + 8;
           entryTag += 8;
         }
         writeUint64BE(buf, 56, sfOffset); // di_size reflects shortform byte length
@@ -705,6 +792,34 @@ export class XfsBuilder implements IFileSystemBuilder {
     const crc = computeCrc32c(buf, 0, inodeSize);
     writeUint32LE(buf, 100, crc);
 
+    return buf;
+  }
+
+  /**
+   * Initializes a valid free/unallocated inode structure in an inode chunk
+   * All inodes in an allocated chunk must pass xfs_inode_buf_verify
+   */
+  private createFreeInode(ino: number, inodeSize: number): Uint8Array {
+    const buf = new Uint8Array(inodeSize);
+    writeUint16BE(buf, 0, XFS_DINODE_MAGIC); // di_magic == 0x494e
+    writeUint16BE(buf, 2, 0); // mode = 0 (free)
+    buf[4] = 3; // di_version = 3 (v5)
+    buf[5] = 0; // format = 0
+    writeUint16BE(buf, 6, 0); // onlink = 0
+    writeUint32BE(buf, 8, 0); // uid = 0
+    writeUint32BE(buf, 12, 0); // gid = 0
+    writeUint32BE(buf, 16, 0); // nlink = 0
+    writeUint32BE(buf, 92, 0); // di_gen
+    writeUint32BE(buf, 96, NULLAGINO); // di_next_unlinked = NULLAGINO (0xffffffff)
+    writeUint32LE(buf, 100, 0); // crc
+    writeUint64BE(buf, 104, 1); // changecount
+    writeUint64BE(buf, 112, 1); // lsn
+    writeUint64BE(buf, 120, 0); // flags2
+    writeUint64BE(buf, 152, ino); // di_ino
+    buf.set(this.uuid, 160); // di_uuid
+
+    const crc = computeCrc32c(buf, 0, inodeSize);
+    writeUint32LE(buf, 100, crc);
     return buf;
   }
 

@@ -45,7 +45,6 @@ export class XfsParser implements IFileSystemParser {
   private inopblock: number = 8;
   private inopblog: number = 3;
   private agblocks: number = 0;
-  private agcount: number = 1;
   private agblklog: number = 0;
   private rootino: number = 128;
   private volumeLabel: string = 'XFS_DISK';
@@ -75,7 +74,6 @@ export class XfsParser implements IFileSystemParser {
 
     this.rootino = Number(readUint64BE(sbBytes, 56));
     this.agblocks = readUint32BE(sbBytes, 84);
-    this.agcount = readUint32BE(sbBytes, 88);
 
     const versionRaw = readUint16BE(sbBytes, 100);
     this.versionnum = versionRaw & 0x000f;
@@ -219,7 +217,10 @@ export class XfsParser implements IFileSystemParser {
           const nameBytes = sf.subarray(off + 3, off + 3 + namelen);
           const name = new TextDecoder('utf-8').decode(nameBytes);
 
-          const inoOffset = off + 3 + namelen;
+          // In XFS v5 (ftype enabled):
+          // namelen (1) + offset (2) + name (namelen) + ftype (1) + inumber (inoSize)
+          const hasFtype = dirInode.version >= 3;
+          const inoOffset = off + 3 + namelen + (hasFtype ? 1 : 0);
           let entryIno = 0;
           if (inoSize === 8 && inoOffset + 8 <= sf.length) {
             entryIno = Number(readUint64BE(sf, inoOffset));
@@ -229,10 +230,7 @@ export class XfsParser implements IFileSystemParser {
 
           entries.push({ name, ino: entryIno });
 
-          // Next entry offset: namelen(1) + offset(2) + name + inoSize + ftype(1)
-          // If v5, ftype is 1 byte
-          const hasFtype = dirInode.version >= 3;
-          off = inoOffset + inoSize + (hasFtype ? 1 : 0);
+          off = inoOffset + inoSize;
         }
       }
     } else if (dirInode.format === XFS_DINODE_FMT_EXTENTS && dirInode.extents.length > 0) {

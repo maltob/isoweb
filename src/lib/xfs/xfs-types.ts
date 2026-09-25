@@ -22,19 +22,48 @@ export const XFS_ABTC_CRC_MAGIC = 0x41423343;  // 'AB3C' (Free space by block co
 export const XFS_IBT_CRC_MAGIC = 0x49414233;   // 'IAB3' (Inode btree v5)
 export const XFS_FIBT_CRC_MAGIC = 0x46494233;  // 'FIB3' (Free Inode btree v5)
 
+// Log record constants
+export const XLOG_HEADER_MAGIC_NUM = 0xfeedbabe;
+export const XLOG_FMT_LINUX_LE = 1;
+export const XLOG_FMT_LINUX_BE = 2;
+export const XLOG_FMT = 1; // Default Linux Little-Endian
+export const XFS_MIN_LOG_BLOCKS = 512; // 512 filesystem blocks (2MB at 4KB)
+export const NULLFSINO = 0xffffffffffffffffn; // (xfs_ino_t)-1 null inode indicator
+export const NULLAGINO = 0xffffffff; // (xfs_agino_t)-1 null AG inode indicator
+
 // Standard Versions
 export const XFS_SB_VERSION_4 = 4;
 export const XFS_SB_VERSION_5 = 5;
 
 // Feature flags for sb_versionnum (v4/v5)
+export const XFS_SB_VERSION_ATTRBIT = 0x0010;
+export const XFS_SB_VERSION_NLINKBIT = 0x0020;
+export const XFS_SB_VERSION_QUOTABIT = 0x0040;
+export const XFS_SB_VERSION_ALIGNBIT = 0x0080;
+export const XFS_SB_VERSION_DALIGNBIT = 0x0100;
+export const XFS_SB_VERSION_LOGV2BIT = 0x0400;
+export const XFS_SB_VERSION_SECTORBIT = 0x0800;
+export const XFS_SB_VERSION_EXTFLGBIT = 0x1000;
+export const XFS_SB_VERSION_DIRV2BIT = 0x2000;
 export const XFS_SB_VERSION_MOREBITSBIT = 0x8000;
+
+// Mandatory sb_versionnum flags for XFS v5
+export const XFS_SB_V5_VERS_FLAGS =
+  XFS_SB_VERSION_5 |
+  XFS_SB_VERSION_NLINKBIT |
+  XFS_SB_VERSION_ALIGNBIT |
+  XFS_SB_VERSION_LOGV2BIT |
+  XFS_SB_VERSION_SECTORBIT |
+  XFS_SB_VERSION_EXTFLGBIT |
+  XFS_SB_VERSION_DIRV2BIT |
+  XFS_SB_VERSION_MOREBITSBIT; // 0x3ca5
+
 export const XFS_SB_VERSION2_LAZYSBCOUNTBIT = 0x00000002;
 export const XFS_SB_VERSION2_ATTR2BIT = 0x00000008;
 export const XFS_SB_VERSION2_PROJID32BIT = 0x00000080;
 export const XFS_SB_VERSION2_CRCBIT = 0x00000100;
 export const XFS_SB_VERSION2_FTYPE = 0x00000200;
-
-// v5 Incompatible features
+export const XFS_SB_FEAT_RO_COMPAT_FINOBT = 1 << 0; // free inode btree
 export const XFS_SB_FEAT_INCOMPAT_FTYPE = 1 << 0;
 
 // Inode Constants
